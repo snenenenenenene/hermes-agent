@@ -1878,8 +1878,14 @@ async def _standalone_send(
         escaped = _escape_unresolved_presentation_mention(message, err) if code != 0 else None
         if escaped is not None:
             logger.info("Buzz: retrying standalone message after unresolved presentation-mention preflight")
-            # Retry intentionally omits auth_tag (legacy behavior).
-            code, out, err = await _exec_buzz(cli_path, args, relay_url=relay, private_key=private_key, input_text=escaped)
+            # The retry keeps the owner attestation: on an owner-gated relay the CLI's mention preflight
+            # re-reads channel membership, and without BUZZ_AUTH_TAG that read is refused (403
+            # relay_membership_required -> "could not load channel membership for mention preflight"),
+            # so a tag-free retry is dead on arrival and the whole delivery is dropped. Mirrors the
+            # live adapter, whose ``_run_cli`` always passes ``self._auth_tag``. ``_exec_buzz`` drops the
+            # var when no tag is configured, so key-only setups are unaffected.
+            code, out, err = await _exec_buzz(cli_path, args, relay_url=relay, private_key=private_key,
+                                              auth_tag=auth_tag, input_text=escaped)
     except asyncio.CancelledError:
         raise
     except OSError as e:

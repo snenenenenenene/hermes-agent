@@ -3470,6 +3470,62 @@ class TestStandaloneSend:
         ]
 
     @pytest.mark.asyncio
+    async def test_standalone_send_mention_retry_keeps_owner_auth_tag(
+        self, monkeypatch, tmp_path
+    ):
+        """The presentation-mention retry must carry BUZZ_AUTH_TAG.
+
+        An owner-gated relay refuses the tag-free membership read the CLI's
+        mention preflight performs (403 relay_membership_required, surfaced as
+        "could not load channel membership for mention preflight"), so a
+        tag-free retry turns a recoverable @-prose payload into a dropped
+        delivery.
+        """
+        from gateway.config import PlatformConfig
+
+        tag = ["auth", "b" * 64, "", "c" * 128]
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://r")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1x")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+        monkeypatch.setenv("BUZZ_AUTH_TAG", json.dumps(tag))
+        monkeypatch.delenv("BUZZ_CREDENTIALS_FILE", raising=False)
+
+        attempts = []
+
+        async def fake_exec(
+            cli_path, args, *, relay_url, private_key, auth_tag="", input_text=None, timeout=30.0
+        ):
+            attempts.append({"args": list(args), "auth_tag": auth_tag, "input_text": input_text})
+            # Every standalone attempt must carry the owner attestation; without it the CLI's
+            # mention preflight cannot read channel membership and the retry dies, dropping the
+            # delivery. Asserted here so the pre-fix run fails as this bug, not as a parse error.
+            assert auth_tag, f"standalone attempt {len(attempts)} reached the CLI without BUZZ_AUTH_TAG"
+            if len(attempts) == 1:
+                return (
+                    1,
+                    "",
+                    "user_error: mention '@KBC' does not match a current channel member; "
+                    "retry with --mention <pubkey>",
+                )
+            return 0, json.dumps({"accepted": True, "event_id": "evt-tagged", "message": ""}), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+
+        result = await _standalone_send(
+            PlatformConfig(enabled=True, extra={}),
+            CHANNEL,
+            "Start it @KBC Fall 2026 is closed.",
+        )
+
+        assert result == {"success": True, "message_id": "evt-tagged"}
+        assert len(attempts) == 2
+        assert attempts[1]["input_text"] == "Start it @\u200bKBC Fall 2026 is closed."
+        for attempt in attempts:
+            assert json.loads(attempt["auth_tag"]) == tag
+
+    @pytest.mark.asyncio
     async def test_standalone_send_extracts_path_from_media_descriptor(self, monkeypatch, tmp_path):
         from gateway.config import PlatformConfig
 
