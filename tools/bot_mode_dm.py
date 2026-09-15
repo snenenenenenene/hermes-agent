@@ -45,6 +45,13 @@ MESSAGE_MAX_CHARS = 16000
 _DM_DIR_NAME = "hermes-dm"
 _DM_STALE_SECONDS = 24 * 60 * 60
 _LIVE_WAIT_SECONDS = 300
+# How long a sender waits for the delivery's own receipt before answering `dispatched`.
+# Bounded and configurable (``bot_mode.delivery_admission_wait_seconds``, 0 = answer
+# immediately): admitting a message into an idle teammate's context takes ~2s, a
+# refusal takes as long as the target's turn lock; past this window the honest answer
+# is "dispatched" and the receipt/notification carries the outcome. This is NOT a wait
+# for the recipient's reply — that still arrives as a completion notification.
+_ADMISSION_WAIT_FALLBACK = 15.0
 
 # '<peer>/<agent>' — peer names are lowercase (``hermes peer`` normalizes them).
 _PEER_TARGET_RE = re.compile(r"^([a-z0-9][a-z0-9_-]{0,63})/([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})$")
@@ -69,7 +76,14 @@ def message_agent_tool_schema() -> dict:
                 "asynchronous, like texting: it validates the target against the live "
                 "roster, delivers your message into that agent's own Bot Chat with your "
                 "attribution automatically prefixed, and returns immediately with a "
-                "delivery acknowledgement. It does NOT return their reply and you must "
+                "delivery receipt whose 'status' is one of: 'landed' (the recipient's "
+                "own store was verified to carry your message), 'bounced' (NOT "
+                "delivered — the recipient was busy or the transport refused it; the "
+                "reason is in the payload), 'dispatched' (accepted and still in "
+                "flight; it was not yet admitted when you were answered), or 'unknown'. "
+                "'dispatched' is NOT delivery — if you need certainty, pass the "
+                "returned delivery_id to the receipt reader rather than assuming. It "
+                "does NOT return their reply and you must "
                 "not wait or poll for one — send it, finish your turn, and the reply "
                 "arrives later as a background-process completion notification that "
                 "wakes you. COMPOSE the message yourself: write what YOU want to say to "
@@ -238,7 +252,7 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
         # so the absolute path stays compatible.
         return _start_delivery([_hermes_cli(), "-p", _self_profile_name(root), "peer", "dm", dm_target], content,
                                f"@{peer_profile or peer_name} on peer '{peer_name}'", stdin_file=True,
-                               author=peer_author, **delivery)
+                               author=peer_author, sender_home=Path(home), **delivery)
 
     # Local teammate.
     is_local_shape = bool(_LOCAL_TARGET_RE.match(raw_target))
@@ -258,7 +272,8 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
                            "machine, or on a registered peer. Pick a name from the roster "
                            "(roles are listed in your system prompt).")
     return _start_delivery([_hermes_cli(), "-p", resolved, *BOT_CHAT_TURN_ARGS], content, f"@{_handle(resolved)}",
-                           stdin_file=False, profile_home=roster_homes[resolved], author=author, **delivery)
+                           stdin_file=False, profile_home=roster_homes[resolved], author=author,
+                           sender_home=Path(home), **delivery)
 
 
 def _try_relay_delivery(root: Path, raw_target: str, content: str, me: str, *,
@@ -372,11 +387,23 @@ def _delivery_lock(argv: list[str], *, stdin_file: bool):
     return acquire_turn_lock(_hermes_root(Path(_default_home())), argv[2])
 
 
-def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None) -> int:
-    """One Bot Chat turn via ``--query-file`` (plus one policy-gated retry); re-emits
-    the transport's streams and returns its exit code. Transient failures re-run the
-    same session; a context_overflow re-run lets the retried turn's pre-API compaction
-    compact the transcript first (no fresh session is ever minted). Auth/quota/config never retry."""
+def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None,
+                    delivery_id: Optional[str] = None):
+    """One Bot Chat turn via ``--query-file`` (plus one policy-gated retry); returns
+    ``(exit code, refusal reason, error text, reply text)`` and prints NOTHING.
+
+    The caller records the delivery's outcome before re-emitting anything: a delivery's
+    receipt must not depend on a stdout pipe that the sender may already have closed
+    (a real case — the runner outlives the sender's turn, and a broken pipe on the
+    reply print turned a landed message into an ``unknown`` one).
+
+    The refusal reason rides back to the caller so the delivery's receipt can say
+    *why* it bounced — this is the layer that knows, and a reason that dies here is the
+    disconnected signal this rail was leaking.
+
+    Transient failures re-run the same session; a context_overflow re-run lets the
+    retried turn's pre-API compaction compact the Bot Chat transcript first (no fresh
+    session is ever minted). Auth/quota/config never retry."""
 
     def _turn():
         return subprocess.run([*argv, "--query-file", dm_file], check=False, stdin=subprocess.DEVNULL,
@@ -401,26 +428,145 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
         # never ran — tell the sender plainly instead of leaking a raw lease error.
         # See #100523.
         who = argv[argv.index("-p") + 1] if "-p" in argv[:-1] else "the teammate"
-        print(json.dumps({
-            "error": f"Delivery failed: @{who}'s Bot Chat is open on another "
-                     "surface right now, so your message was NOT delivered. Try again later.",
-            "reason": "target_busy",
-        }))
-        return 1
-    # Re-emit the transport's streams: stdout is the reply text the
-    # completion notification carries back to the sending agent. A successful bare
-    # silence marker is a delivery decision (same rule as the gateway and the live
-    # Bot Chat completion): the turn stays in the target's transcript, the sender
-    # never sees the marker as prose.
+        error = (f"Delivery failed: @{who}'s Bot Chat is open on another "
+                 "surface right now, so your message was NOT delivered. Try again later.")
+        return 1, "target_busy", error, ""
+    # stdout is the reply text the completion notification carries back to the sending
+    # agent. A successful bare silence marker is a delivery decision (same rule as the
+    # gateway and the live Bot Chat completion): the turn stays in the target's
+    # transcript, the sender never sees the marker as prose.
     from gateway.response_filters import is_intentional_silence_response
     reply = proc.stdout or ""
     if proc.returncode == 0 and is_intentional_silence_response(reply):
         reply = ""
-    for stream, text in ((sys.stdout, reply), (sys.stderr, proc.stderr)):
-        if text:
-            stream.write(text)
-            stream.flush()
-    return proc.returncode
+    return proc.returncode, (reason or None), (stderr_text.strip()[-500:] if proc.returncode != 0 else ""), reply
+
+
+def _emit_turn_output(code: int, refusal: Optional[str], error: str, reply: str, argv: list[str]) -> None:
+    """Re-emit the transport's streams for the sender's completion notification.
+
+    Only a ``target_busy`` refusal prints a machine-readable payload (``status`` +
+    ``delivery_id`` + reason) — the same contract as before, now with the delivery id so
+    the notification can be matched to its receipt. A closed stdout pipe is not a
+    delivery failure (the outcome is already recorded), so it is suppressed rather than
+    escalated into a spurious error notification."""
+    with contextlib.suppress(BrokenPipeError, ValueError, OSError):
+        if refusal == "target_busy":
+            print(json.dumps({"status": "bounced", "error": error, "reason": "target_busy"}))
+        elif code != 0 and error:
+            sys.stderr.write(error if error.endswith("\n") else error + "\n")
+        if code == 0 and reply:
+            sys.stdout.write(reply)
+            sys.stdout.flush()
+
+
+def _record_cli_outcome(home: Optional[Path], delivery_id: Optional[str], dm_file: str, *,
+                        code: int, refusal: Optional[str], error: str, since: float) -> None:
+    """Terminal receipt for a local Bot Chat turn.
+
+    ``landed`` is only ever written from the TARGET's own transcript
+    (:func:`tools.bot_delivery_receipt.verify_admission`) — an exit code is not
+    evidence that a message reached anyone. A transport refusal is ``bounced``; a
+    turn that exited 0 without a row, or a crash with no identified refusal, is
+    ``unknown`` and says so rather than rounding up to success.
+    """
+    if home is None or not delivery_id:
+        return
+    from tools.bot_delivery_receipt import verify_admission
+
+    if code == 0:
+        try:
+            text = Path(dm_file).read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        hit = verify_admission(home, text, since=since)
+        if hit:
+            _receipt_write(home, delivery_id, status="landed", session_id=hit["session_id"],
+                           message_row_id=hit["message_row_id"], received_at=hit["received_at"],
+                           detail=f"admitted into {hit['session_id']} at row {hit['message_row_id']}")
+        else:
+            _receipt_write(home, delivery_id, status="unknown", reason="no_row_found",
+                           error="the delivery turn exited 0 but the target's own store carries "
+                                 "no row for this message")
+        return
+    if refusal:
+        _receipt_write(home, delivery_id, status="bounced", reason=refusal, error=error or refusal)
+    else:
+        _receipt_write(home, delivery_id, status="unknown", reason="transport_stopped",
+                       error=error or f"the delivery turn exited {code} without an identified refusal")
+
+
+def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
+                  profile_home: Path | None = None, author: Optional[dict] = None,
+                  delivery_id: Optional[str] = None) -> int:
+    """Route to the live owner before attempting a CLI transport. Live deliveries
+    retain their intent/payload and immutable receipt; only CLI/peer payloads are
+    removed after consumption. The CLI turn window holds the profile lock, so two
+    deliveries into one profile queue; a bounded wait ends in a 'target_busy' refusal.
+    ``author`` rides to the child as HERMES_TURN_AUTHOR; ``hermes peer dm`` forwards it in the request body.
+
+    Every exit path here writes this delivery's terminal receipt in the home where
+    admission is observable (the target's, or the sender's for a transport that
+    crosses installs) — the sender's ack reads that receipt, so a refusal can no
+    longer reach the caller as silence + `sent`.
+
+    Local (query-file) turns get one policy-gated retry (#93091 item 5): transient failures re-run the same
+    session; a context_overflow re-run lets the retried turn's pre-API compaction pass compact the Bot Chat
+    transcript first (agent/conversation_loop.py) — the sanctioned compression lever; no fresh session is
+    ever minted. Auth/quota/config failures never retry. Peer transports (stdin mode) retry on their own
+    gateway's deliver path, not here.
+    """
+    started = time.time()
+    receipt_home = profile_home if profile_home is not None else _local_delivery_home(argv)
+    # The live consumer owns turn admission; never compete for its CLI lease.
+    if not stdin_file:
+        home = profile_home or _local_delivery_home(argv)
+        if home is not None or Path(dm_file + ".live.json").exists():
+            try:
+                record = _admit_live_dm(home, dm_file, author)
+            except Exception as exc:
+                # The mailbox is the receipt for this transport: a failure to admit is
+                # written there as the delivery's own row, not reported as dispatched.
+                print(json.dumps({"status": "unknown", "delivery_id": delivery_id,
+                    "error": f"Live admission outcome unknown: {exc}. Do not resend.",
+                    "evidence_file": dm_file}))
+                return 1
+            if record is not None:
+                return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file)
+    try:
+        from tools.bot_relay import TurnBusyError, delivery_env
+
+        env = delivery_env(author, profile_home if not stdin_file else None)
+        try:
+            with _delivery_lock(argv, stdin_file=stdin_file):
+                if not stdin_file:
+                    code, refusal, error, reply = _run_local_turn(argv, dm_file, env=env,
+                                                                  delivery_id=delivery_id)
+                    # Receipt BEFORE the reply is re-emitted: the outcome of the delivery
+                    # must not depend on a stdout pipe that the sender may already have
+                    # closed (the runner outlives the sender's turn).
+                    _record_cli_outcome(receipt_home, delivery_id, dm_file, code=code,
+                                        refusal=refusal, error=error, since=started)
+                    _emit_turn_output(code, refusal, error, reply, argv)
+                    return code
+                # Keep the file open until the transport exits; cleanup occurs
+                # after subprocess.run returns, not merely after stdin reaches EOF.
+                with open(dm_file, "r", encoding="utf-8") as stream:
+                    code = subprocess.run(argv, stdin=stream, check=False, env=env).returncode
+                if code != 0 and receipt_home is not None:
+                    # Where the target lives on another install its admission is not
+                    # observable here: record the transport's own verdict by its exit code.
+                    _receipt_write(receipt_home, delivery_id, status="bounced", reason="peer_transport_failed",
+                                   error=f"the peer transport exited {code}")
+                return code
+        except TurnBusyError as exc:
+            # A queued delivery that ran out its budget behind another turn: the message
+            # was never handed to the target, so this is a bounce with a reason — the
+            # exact case that used to answer `sent` and bounce minutes later.
+            _receipt_write(receipt_home, delivery_id, status="bounced", reason="target_busy", error=str(exc))
+            raise
+    finally:
+        _unlink_dm_file(dm_file)
 
 
 def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dict] = None) -> dict | None:
@@ -459,27 +605,42 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
 
 
 def _wait_live_dm(home: str, delivery_id: str, *, dm_file: "str | os.PathLike | None" = None) -> int:
+    """Bounded wait for the live owner's verdict, reported in the sender vocabulary.
+
+    ``queued`` is not delivery: it stays ``dispatched`` until the owner has the message
+    in hand (``claimed``/``settled`` = ``landed``). The mailbox's own state is preserved
+    as ``mailbox_status`` so the translation does not hide detail.
+    """
     from tools.bot_live_delivery import read_delivery_result
 
     deadline = time.monotonic() + _LIVE_WAIT_SECONDS
     while True:
         record = read_delivery_result(home, delivery_id)
-        status = record["status"] if record else "ambiguous"
-        if status not in ("queued", "claimed") or time.monotonic() >= deadline:
+        mailbox = record["status"] if record else "ambiguous"
+        if mailbox not in ("queued", "claimed") or time.monotonic() >= deadline:
             break
         time.sleep(min(0.5, max(0, deadline - time.monotonic())))
     payload = {key: record[key] for key in ("reply", "error", "reason") if record and record.get(key)}
-    payload.update(status=status, delivery_id=delivery_id)
-    if status in ("queued", "claimed", "ambiguous"):
+    status = _mailbox_sender_status(record or {})
+    payload.update(status=status, mailbox_status=mailbox, delivery_id=delivery_id, transport="live")
+    if status == "landed":
+        payload["detail"] = ("Landed: the live Bot Chat owner ran your message into its turn. "
+                             "Do NOT resend; the reply arrives as its own notification.")
+    elif status == "bounced":
+        payload["detail"] = ("NOT delivered: the live mailbox closed this delivery without the owner "
+                             "running the message.")
+    else:
         payload["detail"] = "Delivery remains pending or its outcome is unknown. Do not resend; receipt is retained."
-    elif status == "settled" and dm_file is not None:
+    if mailbox == "settled" and dm_file is not None:
         # The intent carries the message plaintext so a retry can replay the SAME delivery id;
         # once the owner settled it nothing retries, so it goes along with the dm file (same
-        # plaintext) — the live branch returns before _run_delivery's own unlink.
+        # plaintext) — the live branch returns before _run_delivery's own unlink. A merely
+        # *claimed* delivery keeps its intent: that file is what routes a retry to the mailbox
+        # instead of spawning a second CLI turn into the same profile.
         _unlink_dm_file(str(dm_file) + ".live.json")
         _unlink_dm_file(str(dm_file))
     print(json.dumps(payload))
-    return 0 if status in ("settled", "queued", "claimed") else 1
+    return 0 if status in ("landed", "dispatched") else 1
 
 
 def _local_delivery_home(argv: list[str]) -> Path | None:
@@ -491,53 +652,120 @@ def _local_delivery_home(argv: list[str]) -> Path | None:
     return dict(_roster(_hermes_root(Path(_default_home())))).get(argv[2])
 
 
-def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
-                  profile_home: Path | None = None, author: Optional[dict] = None) -> int:
-    """Route to the live owner before attempting a CLI transport. Live deliveries
-    retain their intent/payload and immutable receipt; only CLI/peer payloads are
-    removed after consumption. The CLI turn window holds the profile lock, so two
-    deliveries into one profile queue; a bounded wait ends in a 'target_busy' refusal.
-    ``author`` rides to the child as HERMES_TURN_AUTHOR; ``hermes peer dm`` forwards it in the request body.
+def admission_wait_seconds() -> float:
+    """Sender's receipt wait (``bot_mode.delivery_admission_wait_seconds``, lazily read;
+    default :data:`_ADMISSION_WAIT_FALLBACK`, 0 answers immediately)."""
+    from tools.bot_relay import _bot_mode_cfg
 
-    Local (query-file) turns get one policy-gated retry (#93091 item 5): transient failures re-run the same
-    session; a context_overflow re-run lets the retried turn's pre-API compaction pass compact the Bot Chat
-    transcript first (agent/conversation_loop.py) — the sanctioned compression lever; no fresh session is
-    ever minted. Auth/quota/config failures never retry. Peer transports (stdin mode) retry on their own
-    gateway's deliver path, not here.
-    """
-    # The live consumer owns turn admission; never compete for its CLI lease.
-    if not stdin_file:
-        home = profile_home or _local_delivery_home(argv)
-        if home is not None or Path(dm_file + ".live.json").exists():
-            try:
-                record = _admit_live_dm(home, dm_file, author)
-            except Exception as exc:
-                print(json.dumps({"status": "ambiguous", "delivery_id": hashlib.sha256(
-                    str(Path(dm_file).resolve()).encode()).hexdigest(),
-                    "error": f"Live admission outcome unknown: {exc}. Do not resend.",
-                    "evidence_file": dm_file}))
-                return 1
-            if record is not None:
-                return _wait_live_dm(record["profile_home"], record["delivery_id"], dm_file=dm_file)
+    val = _bot_mode_cfg("delivery_admission_wait_seconds", loader="load_config")
+    return float(_ADMISSION_WAIT_FALLBACK) if val is None else max(0.0, float(val))
+
+
+def _receipt_write(home: Optional[Path], delivery_id: Optional[str], **kwargs) -> str:
+    """Best-effort receipt write; returns an error string instead of raising (a receipt
+    must never break a delivery — but a receipt that could not be written is reported
+    to the sender in the ack, never swallowed)."""
+    if home is None or not delivery_id:
+        return ""
     try:
-        from tools.bot_relay import delivery_env
+        from tools.bot_delivery_receipt import write_receipt
 
-        env = delivery_env(author, profile_home if not stdin_file else None)
-        with _delivery_lock(argv, stdin_file=stdin_file):
-            if not stdin_file:
-                return _run_local_turn(argv, dm_file, env=env)
-            # Keep the file open until the transport exits; cleanup occurs
-            # after subprocess.run returns, not merely after stdin reaches EOF.
-            with open(dm_file, "r", encoding="utf-8") as stream:
-                return subprocess.run(argv, stdin=stream, check=False, env=env).returncode
-    finally:
-        _unlink_dm_file(dm_file)
+        write_receipt(home, delivery_id, **kwargs)
+        return ""
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.error("delivery receipt write failed for %s: %s", delivery_id, exc, exc_info=True)
+        return f"receipt_not_recorded: {exc}"
+
+
+def _payload_from_receipt(payload: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
+    """The sender-facing ack rebuilt from the delivery's own receipt."""
+    from tools.bot_delivery_receipt import describe
+
+    status = record.get("status", "unknown")
+    out = dict(payload, status=status, receipt=describe(record))
+    target = payload.get("to") or "the recipient"
+    if status == "landed":
+        out["received_at"] = record.get("received_at")
+        if record.get("session_id"):
+            out["session_id"] = record["session_id"]
+        out["detail"] = (f"Landed: {target}'s own store carries your message "
+                         f"(session {record.get('session_id') or '?'}). This is asynchronously "
+                         "delivered — do NOT wait or poll for the reply; its completion "
+                         "notification wakes you.")
+    elif status == "bounced":
+        out["error"] = record.get("error") or f"The message to {target} was NOT delivered."
+        out["reason"] = record.get("reason") or "delivery_failed"
+        out["detail"] = (f"NOT delivered to {target}. The message did not land and this "
+                         "delivery_id is closed — compose a fresh send if it still matters.")
+    else:  # unknown
+        out["error"] = record.get("error") or "The delivery's outcome could not be determined."
+        out["reason"] = "unknown"
+        out["detail"] = (f"Outcome unknown for {target}: the transport stopped without evidence "
+                         "that the message landed. Do not assume it arrived; check the receipt "
+                         "before resending so the recipient does not get it twice.")
+    out["delivery_id"] = record.get("delivery_id") or payload.get("delivery_id")
+    return out
+
+
+def _classify_dispatch(payload: dict[str, Any], home: Optional[Path], delivery_id: Optional[str],
+                       *, wait: Optional[float] = None) -> dict[str, Any]:
+    """Turn the spawn ack into a fact: wait (bounded) for this delivery's terminal
+    receipt and report ``landed``/``bounced`` if it arrives, otherwise leave the honest
+    ``dispatched`` standing."""
+    if payload.get("status") != "dispatched" or home is None or not delivery_id:
+        return payload
+    budget = admission_wait_seconds() if wait is None else max(0.0, float(wait))
+    if budget <= 0:
+        return payload
+    from tools.bot_delivery_receipt import wait_for_terminal
+
+    record = wait_for_terminal(home, delivery_id, timeout=budget)
+    if record and record.get("terminal"):
+        return _payload_from_receipt(payload, record)
+    payload["waited_seconds"] = round(budget, 1)
+    return payload
+
+
+def _mailbox_sender_status(record: dict[str, Any]) -> str:
+    """A live-mailbox state as the sender-facing vocabulary (one language for both
+    transports — ``queued`` is not delivery, ``claimed``/``settled`` is)."""
+    from tools.bot_delivery_receipt import MAILBOX_STATUS
+
+    return MAILBOX_STATUS.get(str(record.get("status") or ""), "unknown")
+
+
+def _live_sender_payload(record: dict[str, Any], label: str) -> dict[str, Any]:
+    """The ack for a delivery admitted into the live Bot Chat mailbox."""
+    status = _mailbox_sender_status(record)
+    payload: dict[str, Any] = dict(status=status, mailbox_status=record.get("status"),
+                                   delivery_id=record.get("delivery_id"), to=label, transport="live")
+    if status == "landed":
+        payload["received_at"] = (record.get("claimed_at") or record.get("completed_at") or 0) / 1e9 or None
+        payload["detail"] = (f"Landed: the live Bot Chat owner took your message into its turn "
+                             f"({label}). Do NOT wait or resend; the reply arrives as its own notification.")
+    elif status == "bounced":
+        payload["error"] = record.get("error") or f"The live owner did not accept the message for {label}."
+        payload["reason"] = record.get("reason") or "delivery_failed"
+        payload["detail"] = f"NOT delivered to {label}: the live mailbox closed this delivery without the owner running it."
+    elif status == "unknown":
+        payload["error"] = record.get("error") or "The live delivery's outcome could not be determined."
+        payload["reason"] = "unknown"
+        payload["detail"] = (f"Outcome unknown for {label} — the mailbox holds the delivery in an "
+                             "undecidable state. Do not resend blindly; the receipt is retained.")
+    else:
+        payload["detail"] = ("Durably queued for the live Bot Chat owner — not yet admitted into "
+                             "their context. Do NOT wait or resend; finish your turn. The receipt "
+                             "carries the outcome under this delivery_id.")
+    return payload
 
 
 def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
-                      profile_home: Path | None = None, author: Optional[dict] = None) -> str:
+                      profile_home: Path | None = None, author: Optional[dict] = None,
+                      delivery_id: Optional[str] = None) -> str:
     """Build an argv-safe command for the cleanup-owning background runner:
-    ``--run-delivery [--author <json>] <mode> <dm_file> [--profile-home <path>] <argv...>``."""
+    ``--run-delivery [--author <json>] [--delivery-id <hex>] <mode> <dm_file>
+    [--profile-home <path>] <argv...>``. The delivery id rides the runner argv so the
+    runner writes its terminal receipt under the same key the sender recorded."""
     runner_argv = [sys.executable, str(Path(__file__).resolve()), "--run-delivery",
                    "stdin" if stdin_file else "query-file", dm_file]
     if profile_home is not None:
@@ -547,48 +775,83 @@ def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
         # The tracked local backend uses Git Bash on native Windows: forward slashes keep drive
         # paths executable there; backslash paths are parsed as command names (exit 127).
         runner_argv = [part.replace("\\", "/") for part in runner_argv]
+    # Inserted after the slash rewrite: JSON escapes are backslashes too.
+    options: list[str] = []
     if author:
-        # Inserted after the slash rewrite: JSON escapes are backslashes too.
-        runner_argv[3:3] = ["--author", json.dumps(author, separators=(",", ":"))]
+        options += ["--author", json.dumps(author, separators=(",", ":"))]
+    if delivery_id:
+        options += ["--delivery-id", delivery_id]
+    if options:
+        runner_argv[3:3] = options
     return shlex.join(runner_argv)
 
 
 def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bool,
                     task_id: Optional[str], agent: Any, profile_home: Path | None = None,
-                    author: Optional[dict] = None) -> str:
-    """Create a DM file and transfer its cleanup ownership to the runner."""
+                    author: Optional[dict] = None, sender_home: Path | None = None) -> str:
+    """Create the DM file, pin its delivery id, and transfer cleanup ownership to the runner.
+
+    One idempotency key per delivery, derived from the DM payload file (the live mailbox
+    keys its intent the same way), so the sender's ``dispatched`` receipt and the runner's
+    terminal one are the same ledger row. ``receipt_home`` is where admission is
+    observable: the target's own home for a local delivery, the sender's home for a
+    transport that crosses installs (peer/relay), where only the hand-off can be attested.
+    """
+    from tools.bot_delivery_receipt import delivery_id_for_dm_file
+
     dm_file = _write_dm_file(content)
+    delivery_id = delivery_id_for_dm_file(dm_file)
+    sender = (author or {}).get("name")
     if profile_home is not None:
         try:
             record = _admit_live_dm(profile_home, dm_file, author)
         except Exception as exc:
-            return json.dumps({"status": "ambiguous", "delivery_id": hashlib.sha256(
-                str(Path(dm_file).resolve()).encode()).hexdigest(),
+            return json.dumps({"status": "unknown", "delivery_id": delivery_id,
                 "error": f"Live delivery admission could not be confirmed: {exc}. Do not resend.",
                 "evidence_file": dm_file})
         if record is not None:
-            command = _delivery_command(argv, dm_file, stdin_file=False, profile_home=profile_home, author=author)
-            notification = json.loads(_spawn_delivery(command, label, task_id=task_id, agent=agent))
-            result = dict(status=record["status"], delivery_id=record["delivery_id"], to=label,
-                          detail="Durably queued for the live Bot Chat owner. Do NOT wait or resend; finish your turn.")
+            command = _delivery_command(argv, dm_file, stdin_file=False, profile_home=profile_home,
+                                        author=author, delivery_id=record["delivery_id"])
+            notification = json.loads(_spawn_delivery(command, label, task_id=task_id, agent=agent,
+                                                      delivery_id=record["delivery_id"],
+                                                      receipt_home=None, sender=sender,
+                                                      transport="live", target=label))
+            result = _live_sender_payload(record, label)
             if notification.get("error"):
                 result["notification_error"] = notification["error"]
             elif notification.get("process_id"):
                 result["process_id"] = notification["process_id"]
             return json.dumps(result)
     try:
-        command = _delivery_command(argv, dm_file, stdin_file=stdin_file, profile_home=profile_home, author=author)
+        command = _delivery_command(argv, dm_file, stdin_file=stdin_file, profile_home=profile_home,
+                                    author=author, delivery_id=delivery_id)
     except BaseException:
         _unlink_dm_file(dm_file)
         raise
-    return _spawn_delivery(command, label, dm_file=dm_file, task_id=task_id, agent=agent)
+    ack = json.loads(_spawn_delivery(command, label, dm_file=dm_file, task_id=task_id, agent=agent,
+                                     delivery_id=delivery_id,
+                                     receipt_home=profile_home if profile_home is not None else sender_home,
+                                     sender=sender,
+                                     transport="local" if profile_home is not None
+                                     else ("peer" if stdin_file else "relay"), target=label))
+    if ack.get("status") == "dispatched":
+        # Bounded wait for the delivery's own receipt: the ack must not be the last word
+        # the sender ever hears about whether the message landed.
+        ack = _classify_dispatch(ack, profile_home, delivery_id)
+    return json.dumps(ack)
 
 
 def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None,
-                    task_id: Optional[str], agent: Any) -> str:
-    """Launch the cleanup-owning runner and transfer file ownership on ack. ``dm_file``
-    is None for relay deliveries (the waiter watches a reply file; envelope artifacts
-    are owned/swept by ``tools/bot_relay.py``)."""
+                    task_id: Optional[str], agent: Any, delivery_id: Optional[str] = None,
+                    receipt_home: Optional[Path] = None, sender: Optional[str] = None,
+                    transport: str = "local", target: Optional[str] = None) -> str:
+    """Launch the cleanup-owning runner, record the dispatch receipt, transfer file
+    ownership on ack.
+
+    ``dm_file`` is None for relay deliveries (the waiter watches a reply file; envelope
+    artifacts are owned/swept by ``tools/bot_relay.py``). The ack says ``dispatched`` —
+    ``sent`` is not a word this tool says, because it never meant delivered.
+    """
     transferred = False
     try:
         from tools.terminal_tool import terminal_tool
@@ -606,15 +869,24 @@ def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None,
             return _err(f"Delivery to {label} failed to start: no process id returned")
         # From here the background runner owns the file (removed after the consumer finishes).
         transferred = True
-        return json.dumps({
-            "status": "sent",
+        receipt_error = _receipt_write(receipt_home, delivery_id, status="dispatched", target=target or label,
+                                       sender=sender, transport=transport,
+                                       detail=f"handed to the {transport} transport")
+        payload: dict[str, Any] = {
+            "status": "dispatched",
+            "delivery_id": delivery_id,
             "to": label,
-            "detail": (f"Message dispatched to {label}. This is asynchronous — do NOT wait "
-                       "or poll. Finish your turn now; when the delivery completes, its "
-                       "notification carries the reply — relay it then, attributed to that agent."),
+            "transport": transport,
+            "detail": (f"Dispatched to {label} — accepted, NOT yet confirmed in their context (`dispatched` "
+                       "is not `landed`). This is asynchronous — do NOT wait or poll for the reply: finish "
+                       "your turn. If the delivery is refused, its completion notification carries "
+                       "status 'bounced' and the reason, under this delivery_id."),
             "process_id": proc_id,
             "sent_at": int(time.time()),
-        })
+        }
+        if receipt_error:
+            payload["receipt_error"] = receipt_error
+        return json.dumps(payload)
     except Exception as exc:
         logger.error("message_agent delivery spawn failed: %s", exc, exc_info=True)
         return _err(f"Delivery to {label} could not be started: {exc}")
@@ -627,28 +899,40 @@ def _delivery_main(args: list[str]) -> int:
     """Runner entry for the argv ``_delivery_command`` builds. Malformed argv exits 2 without touching the DM file."""
     if not args or args[0] != "--run-delivery":
         return 2
-    rest, author = args[1:], None
-    if rest[:1] == ["--author"]:
-        from agent.turn_author import parse_turn_author
-
-        author = parse_turn_author(rest[1]) if len(rest) > 1 else None
-        if author is None:
+    rest, author, delivery_id = args[1:], None, None
+    while rest[:1] and rest[0] in ("--author", "--delivery-id"):
+        if len(rest) < 2:
             return 2
+        if rest[0] == "--author":
+            from agent.turn_author import parse_turn_author
+
+            author = parse_turn_author(rest[1])
+            if author is None:
+                return 2
+        else:
+            delivery_id = rest[1]
         rest = rest[2:]
     if len(rest) < 2 or rest[0] not in ("stdin", "query-file"):
         return 2
+    argv: list[str] = rest[2:]
+    profile_home: Path | None = None
+    if len(argv) >= 2 and argv[0] == "--profile-home":
+        profile_home, argv = Path(argv[1]), argv[2:]
     try:
-        argv, profile_home = rest[2:], None
-        if len(argv) >= 2 and argv[0] == "--profile-home":
-            profile_home, argv = Path(argv[1]), argv[2:]
-        return _run_delivery(argv, rest[1], stdin_file=rest[0] == "stdin", profile_home=profile_home, author=author)
+        return _run_delivery(argv, rest[1], stdin_file=rest[0] == "stdin", profile_home=profile_home,
+                             author=author, delivery_id=delivery_id)
     except Exception as exc:
         # 'target_busy': the queued delivery gave up after its bounded wait — surface the
         # structured payload on stdout so the completion notification carries it back.
         if getattr(exc, "reason", "") == "target_busy":
             # See #93091.
-            print(json.dumps({"error": str(exc), "reason": "target_busy"}))
+            print(json.dumps({"status": "bounced", "delivery_id": delivery_id,
+                              "error": str(exc), "reason": "target_busy"}))
         else:
+            # A runner that stopped without a verdict must not leave the sender reading
+            # `dispatched` as "on its way": close the receipt as unknown, with the error.
+            _receipt_write(profile_home or _local_delivery_home(argv), delivery_id, status="unknown",
+                           reason="runner_stopped", error=f"{type(exc).__name__}: {exc}")
             print(f"message_agent delivery failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 

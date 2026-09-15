@@ -26,6 +26,14 @@ def _fresh_probe_cache():
     bot_mode_probe._reset_cache_for_tests()
 
 
+@pytest.fixture(autouse=True)
+def _no_admission_wait(monkeypatch):
+    """Production waits (bounded) on the delivery's receipt before answering; tests that
+    fake the transport have no runner to write one, so the wait would just burn the
+    budget. The wait itself is covered by its own tests, which pass an explicit budget."""
+    monkeypatch.setattr(bot_mode_dm, "admission_wait_seconds", lambda: 0.0)
+
+
 def _managed_home(tmp_path, *, teammates=("researcher",), peers=()) -> Path:
     home = tmp_path / ".hermes"
     home.mkdir(exist_ok=True)
@@ -211,16 +219,33 @@ def _capture_spawn(monkeypatch):
     return calls
 
 
+#: Runner options the sender may prepend to the transport argv (``--author <json>``,
+#: ``--delivery-id <hex>``); the helper must skip them whatever their order.
+_RUNNER_OPTIONS = ("--author", "--delivery-id")
+
+
 def _runner_parts(command):
-    """(mode, dm_file, transport argv) of a runner command. The optional ``--author <json>`` pair is skipped."""
+    """(mode, dm_file, transport argv) of a runner command, with the sender's option
+    pairs (``--author``, ``--delivery-id``) skipped."""
     parts = shlex.split(command)
     marker = parts.index("--run-delivery")
-    if parts[marker + 1] == "--author":
+    if parts[marker + 1] in _RUNNER_OPTIONS:
+        marker += 2
+    if parts[marker + 1] in _RUNNER_OPTIONS:
         marker += 2
     argv = parts[marker + 3 :]
     if argv[:1] == ["--profile-home"]:
         argv = argv[2:]
     return parts[marker + 1], parts[marker + 2], argv
+
+
+def _runner_delivery_id(command):
+    """The ``--delivery-id`` value of a runner command, or None when the pair is absent."""
+    parts = shlex.split(command)
+    marker = parts.index("--run-delivery")
+    if "--delivery-id" not in parts[marker:marker + 6]:
+        return None
+    return parts[parts.index("--delivery-id", marker) + 1]
 
 
 def _runner_author(command):
@@ -250,7 +275,7 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
             agent=agent,
         )
     )
-    assert result["status"] == "sent"
+    assert result["status"] == "dispatched"
     assert result["to"] == "@researcher"
     assert result["process_id"] == "proc_test1234"
     assert "do NOT wait" in result["detail"]
@@ -310,7 +335,7 @@ def test_peer_delivery_command_pins_registry_profile_for_secondary_bots(
     result = json.loads(
         bot_mode_dm.message_agent_tool(target="spark", message="ping", agent=agent)
     )
-    assert result["status"] == "sent"
+    assert result["status"] == "dispatched"
     mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
     assert mode == "stdin"
     # The registry the tool validated against is the machine root's — the
@@ -328,7 +353,7 @@ def test_peer_delivery_command(tmp_path, monkeypatch):
     result = json.loads(
         bot_mode_dm.message_agent_tool(target="spark/researcher", message="ping", agent=agent)
     )
-    assert result["status"] == "sent"
+    assert result["status"] == "dispatched"
     assert "spark" in result["to"]
     mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
     assert mode == "stdin"
@@ -340,7 +365,7 @@ def test_peer_delivery_command(tmp_path, monkeypatch):
     result2 = json.loads(
         bot_mode_dm.message_agent_tool(target="spark", message="ping", agent=agent)
     )
-    assert result2["status"] == "sent"
+    assert result2["status"] == "dispatched"
     mode, _dm_file, transport_argv = _runner_parts(calls[1]["command"])
     assert mode == "stdin"
     assert transport_argv == ["hermes", "-p", "default", "peer", "dm", "spark"]
@@ -364,7 +389,7 @@ def test_delivery_pins_the_hermes_entrypoint_beside_this_interpreter(tmp_path, m
     result = json.loads(
         bot_mode_dm.message_agent_tool(target="researcher", message="ping", agent=agent)
     )
-    assert result["status"] == "sent"
+    assert result["status"] == "dispatched"
     mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
     assert mode == "query-file"
     assert transport_argv[0] == str(hermes_entry)
@@ -374,7 +399,7 @@ def test_delivery_pins_the_hermes_entrypoint_beside_this_interpreter(tmp_path, m
     result2 = json.loads(
         bot_mode_dm.message_agent_tool(target="spark", message="ping", agent=agent)
     )
-    assert result2["status"] == "sent"
+    assert result2["status"] == "dispatched"
     mode, _dm_file, transport_argv = _runner_parts(calls[1]["command"])
     assert mode == "stdin"
     assert transport_argv == [str(hermes_entry), "-p", "default", "peer", "dm", "spark"]
@@ -388,8 +413,8 @@ def test_peer_delivery_author_carries_the_sender_hostname_and_local_stays_bare(t
     home = _managed_home(tmp_path, teammates=("researcher", "coder"), peers=("spark",))
     agent = _FakeAgent(home / "profiles" / "coder", title="Bot Chat")
 
-    assert json.loads(bot_mode_dm.message_agent_tool(target="spark", message="ping", agent=agent))["status"] == "sent"
-    assert json.loads(bot_mode_dm.message_agent_tool(target="researcher", message="ping", agent=agent))["status"] == "sent"
+    assert json.loads(bot_mode_dm.message_agent_tool(target="spark", message="ping", agent=agent))["status"] == "dispatched"
+    assert json.loads(bot_mode_dm.message_agent_tool(target="researcher", message="ping", agent=agent))["status"] == "dispatched"
 
     assert _runner_author(calls[0]["command"]) == {"id": "bot:erimac.local/coder", "name": "coder", "is_bot": True}
     assert _runner_author(calls[1]["command"]) == {"id": "bot:coder", "name": "coder", "is_bot": True}
@@ -405,7 +430,7 @@ def test_named_profile_sender_prefix(tmp_path, monkeypatch):
     result = json.loads(
         bot_mode_dm.message_agent_tool(target="researcher", message="hi", agent=agent)
     )
-    assert result["status"] == "sent"
+    assert result["status"] == "dispatched"
     _mode, dm_file, _transport_argv = _runner_parts(calls[0]["command"])
     assert Path(dm_file).read_text(encoding="utf-8").startswith(
         "Message from 🤖 coder (@coder): "
@@ -467,7 +492,8 @@ def test_live_dm_admitted_before_waiter_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(terminal, "terminal_tool", lambda *a, **k: json.dumps({"error": "spawn failed"}))
 
     result = json.loads(bot_mode_dm.message_agent_tool("researcher", "hello", agent=_FakeAgent(home)))
-    assert result["status"] == "queued"
+    assert result["status"] == "dispatched"           # mailbox `queued` is NOT delivery
+    assert result["mailbox_status"] == "queued"
     record = live.read_delivery_result(target, result["delivery_id"])
     assert record is not None
     assert record["owner"] == owner
@@ -491,14 +517,16 @@ def test_live_dm_runner_retry_never_reexecutes_failed_claim(tmp_path, monkeypatc
     argv = ["hermes", "-p", "researcher"]
     assert bot_mode_dm._run_delivery(argv, str(dm_file), stdin_file=False) == 0
     queued = json.loads(capsys.readouterr().out)
-    assert queued["status"] == "queued"
+    assert queued["status"] == "dispatched"            # queued in the mailbox, not landed
+    assert queued["mailbox_status"] == "queued"
     claimed = live.claim_pending_delivery(target, owner)
     assert claimed is not None
     live.complete_delivery(target, claimed["delivery_id"], status="failed", error="HTTP 429 rate limit")
     monkeypatch.setattr(live, "find_canonical_live_owner", lambda h: None)
     assert bot_mode_dm._run_delivery(argv, str(dm_file), stdin_file=False) == 1
     failed = json.loads(capsys.readouterr().out)
-    assert failed["status"] == "failed"
+    assert failed["status"] == "bounced"               # the mailbox refused it: NOT delivered
+    assert failed["mailbox_status"] == "failed"
     assert failed["delivery_id"] == queued["delivery_id"]
     assert dm_file.read_text(encoding="utf-8") == "hello"
 
@@ -593,19 +621,28 @@ def test_delivery_runner_surfaces_live_owner_refusal(tmp_path, capsys):
     assert "NOT delivered" in payload["error"]
 
 
-def test_local_turn_reemits_empty_stdout_for_a_bare_silence_marker(tmp_path, capsys):
+def test_local_turn_returns_the_silence_filtered_reply_and_emits_it(tmp_path, capsys):
     """#110782: the one-shot ``hermes chat -c "Bot Chat"`` transport applies the gateway's
-    silence rule — a successful bare marker reaches the sender as "", prose stays verbatim."""
+    silence rule — a successful bare marker reaches the sender as "", prose stays verbatim.
+
+    The turn itself returns the reply and prints nothing (the runner records the delivery's
+    receipt first, then re-emits); ``_emit_turn_output`` is the emitter."""
     dm_file = tmp_path / "message.txt"
     dm_file.write_text("thanks, bye", encoding="utf-8")
     child = tmp_path / "quiet.py"
     child.write_text("import sys\nprint(sys.argv[1])\n", encoding="utf-8")
+    argv = [sys.executable, str(child), "NO_REPLY"]
 
-    assert bot_mode_dm._run_local_turn([sys.executable, str(child), "NO_REPLY"], str(dm_file)) == 0
+    code, refusal, error, reply = bot_mode_dm._run_local_turn(argv, str(dm_file))
+    assert (code, refusal, error, reply) == (0, None, "", "")
+    bot_mode_dm._emit_turn_output(code, refusal, error, reply, argv)
     assert capsys.readouterr().out == ""
 
     prose = "The NO_REPLY marker means do not answer."
-    assert bot_mode_dm._run_local_turn([sys.executable, str(child), prose], str(dm_file)) == 0
+    code, refusal, error, reply = bot_mode_dm._run_local_turn([sys.executable, str(child), prose], str(dm_file))
+    assert (code, refusal, error) == (0, None, "")
+    assert reply.strip() == prose
+    bot_mode_dm._emit_turn_output(code, refusal, error, reply, argv)
     assert capsys.readouterr().out.strip() == prose
 
 
@@ -854,7 +891,7 @@ def test_successful_spawn_transfers_cleanup_to_runner(tmp_path, monkeypatch):
         )
     )
 
-    assert result["status"] == "sent"
+    assert result["status"] == "dispatched"
     assert dm_file.exists(), "the parent must not delete before the background runner reads"
 
 
@@ -976,3 +1013,20 @@ def test_settled_live_wait_unlinks_the_intent_but_a_pending_one_keeps_it(tmp_pat
     assert bot_mode_dm._wait_live_dm(str(tmp_path), "d1", dm_file=dm_file) == 0
     assert not intent.exists()
     assert not dm_file.exists(), "the dm .txt holds the same plaintext as the settled intent"
+
+def test_emit_turn_output_swallows_a_closed_stdout_pipe(monkeypatch):
+    """The runner outlives the sender's turn, so its stdout pipe can already be gone. The
+    receipt is written before the re-emit, and the re-emit itself must never turn a
+    delivered message into an error notification."""
+    class _Exploding:
+        def write(self, *_a, **_k):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def flush(self):
+            raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(bot_mode_dm.sys, "stdout", _Exploding())
+    monkeypatch.setattr(bot_mode_dm.sys, "stderr", _Exploding())
+    bot_mode_dm._emit_turn_output(0, None, "", "reply text", ["hermes", "-p", "ops"])
+    bot_mode_dm._emit_turn_output(1, "target_busy", "NOT delivered", "", ["hermes", "-p", "ops"])
+    bot_mode_dm._emit_turn_output(1, None, "boom", "", ["hermes", "-p", "ops"])
