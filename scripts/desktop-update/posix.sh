@@ -39,7 +39,7 @@ ORIGINAL_ARGS=("$@")
 INSTALL_ROOT="" BRANCH="main" DESKTOP_PID=0 RELAUNCH_TARGET=""
 RELAUNCH_CWD="" SANDBOX_FALLBACK=0 RELAUNCH_ARGS=()
 NO_UI=0 NO_MARKER_CLEANUP=0 SELF_TEST_UI=0 SELF_TEST_GATE=0 SELF_TEST_MARKER=0
-SELF_TEST_TCC_HEAL=0
+SELF_TEST_TCC_HEAL=0 SELF_TEST_HEAD_MOVE=0
 HANDOFF_DAEMONIZED=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -54,6 +54,7 @@ while [ $# -gt 0 ]; do
     --self-test-ui) SELF_TEST_UI=1; shift ;;
     --self-test-gate) SELF_TEST_GATE=1; shift ;;
     --self-test-tcc-heal) SELF_TEST_TCC_HEAL=1; shift ;;
+    --self-test-head-move) SELF_TEST_HEAD_MOVE=1; NO_UI=1; NO_MARKER_CLEANUP=1; shift ;;
     --daemonized) HANDOFF_DAEMONIZED=1; shift ;;
     --self-test-marker) SELF_TEST_MARKER=1; NO_UI=1; NO_MARKER_CLEANUP=1; shift ;;
     --) shift; RELAUNCH_ARGS=("$@"); shift $# ;;
@@ -77,6 +78,46 @@ FINAL_MSG="update did not complete"
 DONE_NOTE=""  # set when the update succeeded but the app will NOT reopen itself
 
 log() { echo "$(date +%Y-%m-%dT%H:%M:%S%z) $1" | tee -a "$LOG" 2>/dev/null; }
+
+# ── HEAD-move record ────────────────────────────────────────────────────────
+# This hand-off runs `hermes update --branch $BRANCH` against the LIVE shared
+# checkout. That command is *entitled* to move HEAD — an unmerged parked branch
+# under the default `switch` strategy is switched by design — but a
+# Desktop-driven move must never be silent. 2026-09-16: this box's checkout was
+# moved off local/profile-env-mirror to main (reflog `checkout: moving from
+# local/profile-env-mirror to main`, then `merge origin/main: Fast-forward`)
+# and the Desktop then rebuilt itself from that tree, with nothing in any log
+# naming the actor. Record it here, every time, before anything else can fail:
+# a line in this hand-off's own log AND a durable receipt under
+# logs/update_receipts/ next to the CLI's own receipts.
+HEAD_MOVES_RECEIPT_DIR="$HERMES_HOME/logs/update_receipts"
+
+head_state() { # "<branch> <sha>" for the install root; never fails
+  local branch sha
+  branch="$(git -C "$INSTALL_ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null)" || branch=""
+  sha="$(git -C "$INSTALL_ROOT" rev-parse HEAD 2>/dev/null)" || sha=""
+  printf '%s %s' "${branch:-detached-or-unknown}" "${sha:-unknown}"
+}
+
+record_head_move() { # <before-state> <after-state>; runs only on an actual move
+  local before="$1" after="$2" note="" line
+  # The setting that forbids this is a MAINTAINED custom branch's contract; if
+  # it is configured for this home, a move is a violation and must read as one.
+  if grep -qs 'parked_branch_strategy:[[:space:]]*update_in_place' "$HERMES_HOME/config.yaml" 2>/dev/null; then
+    note=" [CONTRACT VIOLATED: updates.parked_branch_strategy=update_in_place is set in $HERMES_HOME/config.yaml]"
+  fi
+  line="$(date -u +%Y-%m-%dT%H:%M:%SZ) HEAD MOVED by the desktop update hand-off: $before -> $after (hermes update --branch $BRANCH in $INSTALL_ROOT)$note"
+  log "$line"
+  mkdir -p "$HEAD_MOVES_RECEIPT_DIR" 2>/dev/null || true
+  printf '%s\n' "$line" >> "$HEAD_MOVES_RECEIPT_DIR/head-moves.jsonl" 2>/dev/null \
+    || log "WARNING: could not write the HEAD-move receipt under $HEAD_MOVES_RECEIPT_DIR"
+}
+
+record_head_move_if_changed() { # <before-state> <after-state>
+  [ -n "$1" ] && [ -n "$2" ] || return 0
+  [ "$1" = "$2" ] && return 0
+  record_head_move "$1" "$2"
+}
 
 # Keep a durable signal breadcrumb.  A detached hand-off used to leave only the
 # generic FINAL_MSG when it was terminated while the updater child was running,
@@ -627,6 +668,23 @@ tcc_pick_update_invoke() { # sets UPDATE_INVOKE; safety net past a failed heal
 }
 
 # ── self-tests: no update, touch nothing ────────────────────────────────────
+if [ "$SELF_TEST_HEAD_MOVE" -eq 1 ]; then
+  # Runs the REAL record_head_move_if_changed against --install-root, with the
+  # before/after states supplied by the caller. A move must leave both a line
+  # in update-head-moves.log and a receipt line; a non-move must leave nothing.
+  # tests/scripts/desktop_update/test_desktop_update_head_move_record.py drives it.
+  trap - EXIT
+  _selftest_before="${HERMES_SELFTEST_HEAD_BEFORE:-}"
+  _selftest_after="${HERMES_SELFTEST_HEAD_AFTER:-}"
+  if [ -z "$_selftest_before" ] || [ -z "$_selftest_after" ]; then
+    echo "SELFTEST FAIL: HERMES_SELFTEST_HEAD_BEFORE/AFTER are required" >&2; exit 64
+  fi
+  record_head_move_if_changed "$_selftest_before" "$_selftest_after"
+  echo "before=$_selftest_before after=$_selftest_after"
+  echo "SELFTEST PASS: head-move record"
+  exit 0
+fi
+
 if [ "$SELF_TEST_TCC_HEAL" -eq 1 ]; then
   # Runs the REAL heal + invoke selection against --install-root and reports;
   # tests/scripts/desktop_update/test_desktop_update_tcc_heal.py drives the state matrix through it.
@@ -761,6 +819,8 @@ cd "$INSTALL_ROOT" || {
   log "$FINAL_MSG"; exit 3
 }
 export PYTHONUNBUFFERED=1
+# Where HEAD stands before the update — the whole point of the record below.
+HEAD_STATE_BEFORE="$(head_state)"
 # --keep-stash: never re-apply local source edits after the update (they stay
 # parked in git stash). Probe --help first: older installed backends don't
 # know the flag and argparse would abort with exit 2, which collides with the
@@ -799,6 +859,12 @@ if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 2 ]; then
   printf '%s\n' "$OUT" >> "$LOG" 2>/dev/null
   log "retry exit code: $CODE"
 fi
+
+# Durable record if `hermes update` moved the live checkout. Silent here means
+# silent everywhere: the CLI prints its notices to THIS hand-off's log, and the
+# desktop-driven case is exactly the one that had no record at all
+# (2026-09-16). Written before the rebuild/relaunch legs can fail.
+record_head_move_if_changed "$HEAD_STATE_BEFORE" "$(head_state)"
 trap 'on_signal TERM' TERM
 
 # Truthful completion: `hermes update` calls a GUI build failure non-fatal
