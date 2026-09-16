@@ -541,8 +541,38 @@ def _desktop_ssh_backend(argv: list) -> bool:
     return "--ssh-session-token-file" in argv
 
 
+def _mirror_profile_env(name: str) -> None:
+    """Make ``HERMES_PROFILE`` name the profile whose home ``HERMES_HOME`` points at.
+
+    Identity follows the home: ``HERMES_HOME`` is what selects the config, skills,
+    sessions and state DB this process actually runs on. ``tools/kanban_tools.py``
+    (comment/attachment authors, ``created_by``, notifier profile),
+    ``hermes_cli/kanban.py`` and the cron guards all read ``HERMES_PROFILE`` as the
+    audit author, so a ``hermes --profile X`` child spawned from a Y session would
+    otherwise keep stamping Y on X's work — the divergence the roster's one-name
+    rule exists to prevent.
+
+    Never raises and never exits: a resolver bug must not stop ``hermes`` from
+    starting (same fail-toward-startup style as the callers below).
+    """
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+
+        resolved = normalize_profile_name(name)
+    except Exception:  # noqa: BLE001 — identity bookkeeping must never block startup
+        resolved = (name or "").strip()
+    if resolved:
+        os.environ["HERMES_PROFILE"] = resolved
+
+
 def _apply_profile_override() -> None:
-    """Pre-parse --profile/-p and set HERMES_HOME before imports."""
+    """Pre-parse --profile/-p and set HERMES_HOME (and HERMES_PROFILE) before imports.
+
+    ``HERMES_PROFILE`` mirrors the effective home in every path this function can
+    take: an explicit flag / sticky active_profile (rule 1), a pre-set
+    profile-shaped home inherited from a parent process (rule 2 — including when an
+    inherited ``HERMES_PROFILE`` disagrees), and a root home (rule 3, fill-only).
+    """
     argv = sys.argv[1:]
     profile_name, consume, profile_index = _scan_profile_flag(argv)
 
@@ -553,6 +583,11 @@ def _apply_profile_override() -> None:
     # `hermes profile use` and the gateway should honour it (#22502).
     hermes_home_env = os.environ.get("HERMES_HOME", "")
     if profile_name is None and hermes_home_env and Path(hermes_home_env).parent.name == "profiles":
+        # Identity mirrors the home we are trusting: the profile dir's own basename
+        # IS the profile this process runs on, so an inherited HERMES_PROFILE that
+        # disagrees (a `--profile` child handing its parent's name down the chain)
+        # is stale and gets corrected rather than kept.
+        _mirror_profile_env(Path(hermes_home_env).name)
         return
 
     if profile_name is None and not _under_gateway_supervisor(argv) and not _desktop_ssh_backend(argv):
@@ -568,6 +603,13 @@ def _apply_profile_override() -> None:
             pass  # corrupted file, skip
 
     if profile_name is None:
+        # Root home (HERMES_HOME unset or pointing at the hermes root) with nothing
+        # left to resolve — e.g. the plain interactive default session or a
+        # supervised default-profile child. Fill a MISSING identity only: an
+        # operator-set HERMES_PROFILE with no explicit flag is not this function's
+        # to reinterpret.
+        if not (os.environ.get("HERMES_PROFILE") or "").strip():
+            os.environ["HERMES_PROFILE"] = "default"
         return
     try:
         from hermes_cli.profiles import resolve_profile_env
@@ -586,6 +628,11 @@ def _apply_profile_override() -> None:
         print(f"Warning: profile override failed ({exc}), using default", file=sys.stderr)
         return
     os.environ["HERMES_HOME"] = hermes_home
+    # Rule 1: the flag (or sticky active_profile) named the profile, and the home we
+    # just adopted is that profile's home — so the identity var follows it. Without
+    # this a `hermes --profile X` child spawned from a Y session keeps Y, and every
+    # kanban comment/attachment/created_by it writes is attributed to Y.
+    _mirror_profile_env(profile_name)
     # Strip the flag from argv so argparse doesn't choke
     if consume > 0 and profile_index is not None:
         start = profile_index + 1  # +1 because argv is sys.argv[1:]
