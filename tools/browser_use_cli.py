@@ -108,6 +108,38 @@ def _real_profile_consented() -> bool:
     return _lazy_call("tools.browser_tool_cloud", "_use_real_profile", False, "real-profile consent lookup failed")
 
 
+def _profile_session_name() -> str:
+    """Session name to use when the caller passed none, or "" to keep the unnamed behaviour.
+
+    A profile pinned to the SHARED agent browser (``browser.cdp_url``, the 2026-09-16 scoped pin) has
+    more than one lane's tabs in it, and ``_OWN_TAB_PREAMBLE`` is only prepended for a *named* session
+    (see browser_exec below): an unnamed attach takes over the browser's CURRENT tab, so a concurrent
+    lane can act inside a page it does not own. Making "always pass a session" a rule every worker has
+    to remember is a rule that fails silently, so a profile-scoped session defaults its name to the
+    profile id — the own-tab preamble then fires without any caller discipline.
+
+    Scoped deliberately: only a non-default profile (an operator's own session keeps the tab it is
+    looking at) that actually resolves a CDP override (a private per-daemon browser has no sibling to
+    collide with). Reads config only — never performs the ``/json/version`` discovery.
+    """
+    name = os.environ.get("HERMES_PROFILE", "").strip()
+    if not name:
+        try:
+            parts = get_hermes_home().resolve().parts
+            name = parts[-1] if len(parts) >= 2 and parts[-2] == "profiles" else ""
+        except Exception:
+            return ""
+    if not name or name == "default" or not _SESSION_RE.match(name):
+        return ""
+    try:
+        from tools.browser_tool_cdp import _get_cdp_override_raw
+        if not _quiet(_get_cdp_override_raw, ""):
+            return ""
+    except Exception:
+        return ""
+    return name
+
+
 def _set_cdp_env(env: dict, cdp: str) -> None:
     """Export a CDP endpoint under the BU_CDP_* contract (http(s) → URL, else WS)."""
     env["BU_CDP_URL" if cdp.startswith(("http://", "https://")) else "BU_CDP_WS"] = cdp
@@ -619,6 +651,10 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
                           "then run `browser-use --doctor` to verify the setup.")
 
     env = _base_subprocess_env()
+    if not session:
+        # Profile-scoped default (see _profile_session_name): on a SHARED browser the own-tab preamble —
+        # and therefore tab isolation from a concurrent lane — only applies to named sessions.
+        session = _profile_session_name()
     if session:
         if not _SESSION_RE.match(session):
             return tool_error(f"Invalid session name {session!r}: use 1-64 letters, digits, "
