@@ -399,6 +399,63 @@ def test_update_updates_unmerged_branch_in_place_when_configured(
     assert "feature work" in _git(repo_pair, "log", "--oneline").stdout
 
 
+def test_update_in_place_keeps_fully_merged_parked_branch(
+    repo_pair, monkeypatch, capsys
+):
+    """updates.parked_branch_strategy: update_in_place — a FULLY MERGED parked
+    branch is still a parked branch.
+
+    Live incident (2026-09-16, the box's shared checkout): the desktop rail
+    ran ``hermes update --branch main`` while the live checkout was parked on
+    ``local/profile-env-mirror``. The branch's local commits were
+    cherry-equivalent to upstream, so the guard took the "fully merged →
+    switch back to the target" shortcut and moved HEAD to main (reflog:
+    ``checkout: moving from local/profile-env-mirror to main`` followed by
+    ``merge origin/main: Fast-forward``), and the Desktop then rebuilt itself
+    from that tree. ``update_in_place`` is read AFTER that shortcut today, so
+    it never gets a say — the setting documents "the checkout never moves".
+
+    Contract: with update_in_place configured the checkout stays put and is
+    brought up to origin/<target> in place, fully merged or not.
+    """
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {"updates": {"parked_branch_strategy": "update_in_place"}},
+    )
+    _patch_update_flow(monkeypatch, repo_pair)
+
+    class _StopFlow(Exception):
+        pass
+
+    monkeypatch.setattr(
+        hermes_main,
+        "_abort_dependency_sync_if_self_locked",
+        lambda *a, **k: (_ for _ in ()).throw(_StopFlow()),
+    )
+    args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+
+    with pytest.raises(_StopFlow):
+        hermes_main.cmd_update(args)
+
+    out = capsys.readouterr().out
+    assert "updating it in place" in out
+    # The branch was NOT switched back to the target.
+    assert "switching back to" not in out
+    assert (
+        _git(repo_pair, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        == "old-feature"
+    )
+    # ...and the checkout still advanced to origin/main's content.
+    assert (repo_pair / "b.txt").exists()
+    assert (repo_pair / "a.txt").read_text() == "two\n"
+    head = _git(repo_pair, "rev-parse", "HEAD").stdout.strip()
+    remote = _git(repo_pair, "rev-parse", "origin/main").stdout.strip()
+    assert head == remote
+
+
 def test_switch_branch_flag_overrides_in_place_strategy(
     repo_pair, monkeypatch, capsys
 ):
