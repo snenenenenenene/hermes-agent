@@ -324,8 +324,11 @@ def _update_owes_fleet_restart() -> bool:
     from hermes_cli.update_cmd import _current_checkout_sha
     from hermes_cli.update_receipt import read_latest_receipt
     restarted_to = _receipt_restart_phase_completed(read_latest_receipt() or {})
-    if restarted_to:
-        return not _live_fleet_covers_receipt(restarted_to, accept_states=("current", "stale"))
+    # A completed restart phase leaves nothing owed while the fleet serves either the code the
+    # update pulled or the checkout we are running now: an operator restart onto a moved checkout
+    # discharges the update (#113350 steps 3-4). A fleet on neither sha is genuinely stale.
+    if restarted_to and _live_fleet_covers_receipt(restarted_to, accept_states=("current", "stale")):
+        return False
     return not _live_fleet_covers_receipt(_current_checkout_sha())
 
 

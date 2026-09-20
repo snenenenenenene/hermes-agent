@@ -803,3 +803,58 @@ def test_startup_warn_silent_when_failed_receipt_already_restarted_fleet(monkeyp
 
     assert capsys.readouterr().err == ""
     assert update_cmd_fleet._pending_fleet_restart_needed() is True
+
+
+@pytest.mark.parametrize(
+    "live_sha, missing_gateway, owes_restart",
+    [("c" * 40, False, False), ("d" * 40, False, True), ("c" * 40, True, True)],
+    ids=["restarted-onto-checkout", "matches-neither-sha", "owed-gateway-down"],
+)
+def test_startup_warn_after_completed_restart_and_moved_checkout(
+    monkeypatch, capsys, live_sha, missing_gateway, owes_restart
+):
+    """A later restart clears the update debt only when every owed gateway is current.
+
+    #113350 steps 3-4: the update pulled ``pulled`` and its restart phase completed, then the
+    checkout moved to ``checkout`` and the operator restarted the gateways onto it. The receipt
+    still names ``pulled``, so holding the fleet to that sha warns forever. Serving the checkout
+    on disk must discharge the update; a fleet on neither sha is a genuinely stale fleet and must
+    still warn.
+    """
+    pulled, checkout = "b" * 40, "c" * 40
+    _patch_marker_sha(monkeypatch, checkout)
+    profiles = ["default", "beta"] if missing_gateway else ["default"]
+    receipt_dir = get_hermes_home() / "logs" / "update_receipts"
+    receipt_dir.mkdir(parents=True)
+    (receipt_dir / "latest.json").write_text(
+        json.dumps(
+            {
+                "outcome": "success", "exit_code": 0,
+                "post_update": {"sha": pulled},
+                "gateway_restart": {"incomplete": False, "phase_error": ""},
+                "fleet": [
+                    {"profile": profile, "code_sha": pulled, "state": "current"}
+                    for profile in profiles
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions",
+        lambda **kwargs: [
+            {"profile": "default", "pid": 42, "code_sha": live_sha,
+             "state": "current" if live_sha == checkout else "stale"}
+        ],
+    )
+
+    assert update_cmd_fleet._update_owes_fleet_restart() is owes_restart
+    update_cmd._warn_pending_fleet_restart_on_startup()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    if owes_restart:
+        assert "did not restart running gateways" in captured.err
+    else:
+        assert captured.err == ""
+    assert update_cmd_fleet._pending_fleet_restart_needed() is owes_restart
+
