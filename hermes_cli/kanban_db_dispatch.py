@@ -1063,7 +1063,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
+                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+                "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
                 (retry_status, row["id"], pid, row["claim_lock"]),

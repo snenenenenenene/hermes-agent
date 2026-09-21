@@ -2168,7 +2168,14 @@ def _claim_and_open_run(
            SET status        = 'running',
                claim_lock    = ?,
                claim_expires = ?,
-               started_at    = COALESCE(started_at, ?)
+               started_at    = COALESCE(started_at, ?),
+               -- A new run must never inherit the previous run's worker identity or
+               -- heartbeat: a stale ``last_heartbeat_at`` makes the reclaim backstop
+               -- judge a just-spawned, healthy worker as wedged (it compares the
+               -- inherited value against the max-stale threshold) and SIGTERM it.
+               worker_pid          = NULL,
+               worker_started_at   = NULL,
+               last_heartbeat_at   = NULL
          WHERE id = ?
            AND status = '{source_status}'
            AND claim_lock IS NULL
@@ -2414,7 +2421,8 @@ def release_stale_claims(
             retry_status = _retry_status_for_run(conn, row["id"])
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
+                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+                "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
                 (retry_status, row["id"], row["claim_lock"], now),
