@@ -118,6 +118,21 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
     )
 
 
+def _rotate_board_slugs(slugs: list, tick_index: int) -> list:
+    """Rotate *slugs* left by ``tick_index % len(slugs)`` (round-robin).
+
+    A pure helper so the rotation policy is testable without a live gateway:
+    ``_KanbanDispatcher.tick_once`` calls it with its per-instance tick counter
+    so each successive tick starts with a different board instead of letting the
+    first board in ``list_boards`` order always win the host cap.
+    """
+    n = len(slugs)
+    if n <= 1:
+        return list(slugs)
+    offset = tick_index % n
+    return slugs[offset:] + slugs[:offset]
+
+
 class _KanbanDispatcher:
     """Per-tick board work for the embedded dispatcher (runs in worker threads).
 
@@ -133,6 +148,10 @@ class _KanbanDispatcher:
         self.kb = kb
         self.settings = settings
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
+        # Round-robin offset for board enumeration (see tick_once): without it,
+        # list_boards' fixed order means the first board always gets the host's
+        # max_in_progress budget and later boards starve.
+        self._tick_index = 0
 
     def _board_slugs(self) -> list:
         return _board_slugs(self.kb)
@@ -208,7 +227,9 @@ class _KanbanDispatcher:
 
     def tick_once(self) -> list[tuple[str, Optional[object]]]:
         """Run one dispatch_once per board. Returns (slug, result) pairs."""
-        return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
+        self._tick_index += 1
+        slugs = _rotate_board_slugs(self._board_slugs(), self._tick_index)
+        return [(slug, self.tick_once_for_board(slug)) for slug in slugs]
 
     def ready_nonempty(self) -> bool:
         """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?

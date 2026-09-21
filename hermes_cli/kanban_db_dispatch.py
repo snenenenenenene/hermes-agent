@@ -143,6 +143,11 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    host_cap_held: bool = False
+    """True when this tick was suppressed because ``kanban.max_in_progress``
+    (the HOST-wide cap) was already met by running workers across all boards.
+    Distinct from the per-board ``max_spawn`` cap and memory pressure: this is
+    the signal that later boards are waiting on the first board's workers."""
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
@@ -166,6 +171,8 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
+        if res.host_cap_held:
+            counts["host_cap"] = counts.get("host_cap", 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
@@ -1973,6 +1980,7 @@ def _tick_spawn_budget(
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.host_cap_held = True
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
