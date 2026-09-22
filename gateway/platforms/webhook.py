@@ -5,7 +5,9 @@ secret (REQUIRED; "INSECURE_NO_AUTH" skips validation, loopback only), prompt te
 deliver/deliver_extra, deliver_only (rendered prompt IS the message), cron_job (fire an existing cron
 job per event; the rendered prompt is transient per-run context; exclusive with deliver_only). Per-route rate limiting,
 idempotency cache, body-size caps checked before reading. Generic HMAC V2 binds a timestamp for
-replay protection; body-only V1 is deprecated but accepted with a warning."""
+replay protection; body-only V1 is deprecated but accepted with a warning. A per-route ``scheme``
+field pins the signature scheme (default ``"auto"`` chooses by header presence); Stripe's
+``Stripe-Signature: t=<ts>,v1=<hex>`` is supported and available as ``scheme: "stripe"``."""
 
 import asyncio
 import base64
@@ -149,6 +151,59 @@ def _validate_svix_signature(body: bytes, secret: str, msg_id: str, timestamp: s
         if _ and version == "v1" and _hmac_str_equal(signature, expected):
             return True
     return False
+
+
+def _validate_stripe_signature(body: bytes, secret: str, signature_header: str) -> bool:
+    """Stripe: ``Stripe-Signature: t=<ts>,v1=<hex>`` — HMAC-SHA256 of ``"<t>.<raw body>"``.
+
+    Multiple ``v1=`` entries (secret rotation) are accepted; the timestamp is bound into the
+    signature and must fall inside the replay window, so a captured pair cannot be replayed later.
+    """
+    if not (signature_header and secret):
+        return False
+    timestamp: Optional[str] = None
+    signatures: List[str] = []
+    for part in signature_header.split(","):
+        key, _, value = part.partition("=")
+        key, value = key.strip(), value.strip()
+        if key == "t":
+            timestamp = value
+        elif key == "v1":
+            signatures.append(value)
+    if not timestamp or not signatures:
+        return False
+    if not _timestamp_fresh(timestamp, "[webhook] Stripe signature timestamp outside replay window"):
+        return False
+    expected = _hex_hmac(secret, timestamp.encode() + b"." + body)
+    return any(_hmac_str_equal(sig, expected) for sig in signatures)
+
+
+def _header_ci(headers, name: str) -> str:
+    """Case-insensitive header read (aiohttp lowercases; a mock dict may not)."""
+    return headers.get(name, "") or headers.get(name.lower(), "") or headers.get(name.upper(), "")
+
+
+def _presented_scheme(headers) -> Optional[str]:
+    """Which signature scheme a request presents, in the same precedence ``auto`` used before
+    scheme pinning existed. ``None`` when no recognised signature header is present."""
+    svix = [_header_ci(headers, n) for n in ("svix-id", "svix-timestamp", "svix-signature")]
+    if not any(svix) and _header_ci(headers, "webhook-signature"):
+        svix = [_header_ci(headers, n) for n in ("webhook-id", "webhook-timestamp", "webhook-signature")]
+    if any(svix):
+        return "svix"
+    if _header_ci(headers, "linear-signature"):
+        return "linear"
+    if headers.get("X-Hub-Signature-256", ""):
+        return "github"
+    if headers.get("X-Gitlab-Token", ""):
+        return "gitlab"
+    if headers.get("X-Webhook-Signature-V2", ""):
+        return "generic_v2"
+    if headers.get("X-Webhook-Signature", ""):
+        return "generic_v1"
+    if headers.get("Stripe-Signature", ""):
+        return "stripe"
+    return None
 
 
 class WebhookAdapter(BasePlatformAdapter):
@@ -327,6 +382,10 @@ class WebhookAdapter(BasePlatformAdapter):
             self._prune_seen_deliveries(now)
         return True
 
+    def _unrecord_delivery_id(self, delivery_id: str) -> None:
+        """Forget a recorded delivery id so a dropped (not completed) delivery can be retried."""
+        self._seen_deliveries.pop(delivery_id, None)
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "webhook"}
 
@@ -462,7 +521,8 @@ class WebhookAdapter(BasePlatformAdapter):
         if not secret:
             logger.error("[webhook] Route %s has no HMAC secret; refusing request", route_name)
             return None, _json_error("Webhook route is missing an HMAC secret", 403)
-        if secret != _INSECURE_NO_AUTH and not self._validate_signature(request, raw_body, secret):
+        if secret != _INSECURE_NO_AUTH and not self._validate_signature(
+                request, raw_body, secret, route_config.get("scheme", "auto")):
             logger.warning("[webhook] Invalid signature for route %s", route_name)
             return None, _json_error("Invalid signature", 401)
         return raw_body, None
@@ -596,6 +656,12 @@ class WebhookAdapter(BasePlatformAdapter):
         if not self._route_processor.route_filters_match(route_config, payload, event_type, request.headers):
             logger.info("[webhook] filtered event=%s route=%s", event_type, route_name)
             return web.json_response({"status": "ignored", "reason": "filter", "route": route_name})
+        delivery_id = headers.get("X-GitHub-Delivery", headers.get("svix-id", headers.get(
+            "webhook-id", headers.get("X-Request-ID", str(int(time.time() * 1000))))))
+        now = time.time()  # idempotency: skip duplicate deliveries (webhook retries) BEFORE any script runs
+        if not self._record_delivery_id(delivery_id, now):
+            logger.info("[webhook] Skipping duplicate delivery %s", delivery_id)
+            return web.json_response({"status": "duplicate", "delivery_id": delivery_id}, status=200)
         # Script, prompt render and skill lookup read the profile's home (skills/, config); the runner
         # only enters the routed profile's scope later around handle_message, so enter it here.
         # See #67277.
@@ -608,18 +674,15 @@ class WebhookAdapter(BasePlatformAdapter):
                     self._route_processor.run_route_script, script, payload)
                 if not keep:
                     logger.info("[webhook] script ignored event=%s route=%s", event_type, route_name)
+                    # A drop is not a completed delivery: un-record so a genuine retry after a drop is
+                    # still processed rather than swallowed as a duplicate.
+                    self._unrecord_delivery_id(delivery_id)
                     return web.json_response({"status": "ignored", "reason": "script", "route": route_name})
                 payload = transformed_payload or payload
             prompt = self._render_prompt(route_config.get("prompt", ""), payload, event_type, route_name)
             # cron_job routes: the job's own skills apply; the rendered prompt is only per-run context.
             if (skills := route_config.get("skills", [])) and not route_config.get("cron_job"):
                 prompt = self._apply_skills(prompt, skills)
-        delivery_id = headers.get("X-GitHub-Delivery", headers.get("svix-id", headers.get(
-            "webhook-id", headers.get("X-Request-ID", str(int(time.time() * 1000))))))
-        now = time.time()  # idempotency: skip duplicate deliveries (webhook retries)
-        if not self._record_delivery_id(delivery_id, now):
-            logger.info("[webhook] Skipping duplicate delivery %s", delivery_id)
-            return web.json_response({"status": "duplicate", "delivery_id": delivery_id}, status=200)
         if route_config.get("cron_job"):
             return self._handle_cron_trigger(prompt, route_config, route_name, event_type, delivery_id, profile)
         if route_config.get("deliver_only"):
@@ -700,37 +763,46 @@ class WebhookAdapter(BasePlatformAdapter):
 
     # --- Signature validation ---
 
-    def _validate_signature(self, request: "web.Request", body: bytes, secret: str) -> bool:
-        """Validate webhook signature (GitHub, GitLab, Svix, Standard Webhooks, Linear, generic HMAC-SHA256)."""
+    def _validate_signature(self, request: "web.Request", body: bytes, secret: str, scheme: str = "auto") -> bool:
+        """Validate webhook signature (GitHub, GitLab, Svix, Standard Webhooks, Linear, generic HMAC-SHA256,
+        Stripe). ``scheme`` defaults to ``"auto"`` (scheme chosen by header presence); a per-route ``scheme``
+        pins the route so only that scheme validates and any other scheme is refused with 401."""
         headers = request.headers
+        route_name = request.match_info.get("route_name", "")
+        presented = _presented_scheme(headers)
+        if scheme and scheme != "auto" and presented != scheme:
+            logger.warning("[webhook] Route '%s' refused scheme '%s' (pinned to '%s')",
+                           route_name, presented or "none", scheme)
+            return False
+        return self._validate_presented_scheme(headers, body, secret, presented, route_name)
 
-        def _header(name: str) -> str:
-            return headers.get(name, "") or headers.get(name.lower(), "") or headers.get(name.upper(), "")
+    def _validate_presented_scheme(self, headers, body: bytes, secret: str, presented: Optional[str],
+                                   route_name: str) -> bool:
+        """Validate exactly the scheme ``presented`` names, preserving each scheme's original semantics.
 
-        # Svix / AgentMail: signed content is "{id}.{timestamp}.{raw_body}". Standard Webhooks
-        # (webhook-*; GitLab signing tokens) is the same scheme under other header names, but GitLab
-        # sends webhook-id/webhook-timestamp on EVERY delivery and webhook-signature only when a signing
-        # token is configured, so only the signature header commits to this path — a legacy
-        # X-Gitlab-Token install must keep validating below (#47451, #101837).
-        svix = [_header(name) for name in ("svix-id", "svix-timestamp", "svix-signature")]
-        if not any(svix) and _header("webhook-signature"):
-            svix = [_header(name) for name in ("webhook-id", "webhook-timestamp", "webhook-signature")]
-        if any(svix):
+        Svix / AgentMail / Standard Webhooks sign ``"{id}.{timestamp}.{raw_body}"``. Standard Webhooks
+        (webhook-*; GitLab signing tokens) is the same scheme under other header names, but GitLab
+        sends webhook-id/webhook-timestamp on EVERY delivery and webhook-signature only when a signing
+        token is configured, so only the signature header commits to this path — a legacy
+        X-Gitlab-Token install must keep validating below (#47451, #101837).
+        """
+        if presented == "svix":
+            svix = [_header_ci(headers, name) for name in ("svix-id", "svix-timestamp", "svix-signature")]
+            if not any(svix) and _header_ci(headers, "webhook-signature"):
+                svix = [_header_ci(headers, name) for name in ("webhook-id", "webhook-timestamp", "webhook-signature")]
             return _validate_svix_signature(body, secret, *svix)
         # Linear (any header case): hex HMAC of the body. GitHub: sha256=<hex>. GitLab: plain token.
-        for provided, expected in (
-                (_header("linear-signature"), lambda: _hex_hmac(secret, body)),
-                (headers.get("X-Hub-Signature-256", ""), lambda: "sha256=" + _hex_hmac(secret, body)),
-                (headers.get("X-Gitlab-Token", ""), lambda: secret)):
-            if provided:
-                return _hmac_str_equal(provided, expected())
-        route_name = request.match_info.get("route_name", "")
+        if presented == "linear":
+            return _hmac_str_equal(_header_ci(headers, "linear-signature"), _hex_hmac(secret, body))
+        if presented == "github":
+            return _hmac_str_equal(headers.get("X-Hub-Signature-256", ""), "sha256=" + _hex_hmac(secret, body))
+        if presented == "gitlab":
+            return _hmac_str_equal(headers.get("X-Gitlab-Token", ""), secret)
         # Generic V2: X-Webhook-Signature-V2 = hex HMAC-SHA256 of "<timestamp>.<body>", X-Webhook-Timestamp
         # required. Presence of the V2 header COMMITS to V2 — it must not fall through to V1 on a
         # missing/bad timestamp, or an attacker could strip the timestamp from a captured mixed V1+V2
         # request and replay it against the still-present body-only V1 signature.
-        v2_sig = headers.get("X-Webhook-Signature-V2", "")
-        if v2_sig:
+        if presented == "generic_v2":
             v2_timestamp = headers.get("X-Webhook-Timestamp", "")
             if not v2_timestamp:
                 logger.warning("[webhook] Route '%s' sent X-Webhook-Signature-V2 with no X-Webhook-Timestamp — "
@@ -739,16 +811,18 @@ class WebhookAdapter(BasePlatformAdapter):
             if not _timestamp_fresh(
                     v2_timestamp, "[webhook] Route '%s' generic HMAC V2 timestamp outside replay window", route_name):
                 return False
-            return _hmac_str_equal(v2_sig, _hex_hmac(secret, v2_timestamp.encode() + b"." + body))
+            return _hmac_str_equal(headers.get("X-Webhook-Signature-V2", ""),
+                                   _hex_hmac(secret, v2_timestamp.encode() + b"." + body))
         # Generic V1 (legacy, deprecated): body-only HMAC → replays indefinitely.
-        generic_sig = headers.get("X-Webhook-Signature", "")
-        if generic_sig:
+        if presented == "generic_v1":
             if route_name not in self._v1_signature_warned:
                 self._v1_signature_warned.add(route_name)
                 logger.warning("[webhook] Route '%s' uses legacy body-only HMAC (no timestamp), which is vulnerable "
                                "to replay attacks. Add an 'X-Webhook-Timestamp' header and switch to "
                                "'X-Webhook-Signature-V2' (HMAC-SHA256 of '<timestamp>.<body>').", route_name)
-            return _hmac_str_equal(generic_sig, _hex_hmac(secret, body))
+            return _hmac_str_equal(headers.get("X-Webhook-Signature", ""), _hex_hmac(secret, body))
+        if presented == "stripe":
+            return _validate_stripe_signature(body, secret, headers.get("Stripe-Signature", ""))
         logger.debug("[webhook] Secret configured but no signature header found")
         return False
 
