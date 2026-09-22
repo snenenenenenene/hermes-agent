@@ -19,7 +19,7 @@ import time
 import pytest
 
 from tools import bot_mode_dm, bot_relay
-from tools.bot_relay import TurnBusyError, acquire_turn_lock, turn_lock_path
+from tools.bot_relay import TurnBusyError, acquire_delivery_slot, acquire_turn_lock, delivery_slot_held, delivery_slot_path, turn_lock_path
 
 
 @pytest.fixture
@@ -343,3 +343,69 @@ def test_relay_deliver_serializes_then_succeeds(tmp_path, monkeypatch):
     assert "error" not in out, out
     assert out["result"]["reply"] == "pong"
     assert time.monotonic() - start >= 0.2, "deliver should have queued"
+
+
+# ── single-flight delivery slot (delivery-ceiling regression) ───────────────
+
+
+def test_delivery_slot_is_single_flight_and_releases_on_fd_close(root):
+    """A second acquire of the delivery slot fails fast (target_busy); closing the
+    holder's fd (process-death semantics) releases it immediately — a killed waiter
+    cannot wedge a target. This is the stale-lock recovery."""
+    path = delivery_slot_path(root, "ops")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(TurnBusyError) as excinfo:
+            with acquire_delivery_slot(root, "ops"):
+                pass  # pragma: no cover — must not acquire
+        assert excinfo.value.reason == "target_busy"
+    finally:
+        os.close(fd)  # holder death — kernel releases the flock
+    # The slot self-heals: a fresh acquire succeeds immediately.
+    with acquire_delivery_slot(root, "ops"):
+        pass
+
+
+def test_delivery_slot_held_probe_matches_acquire(root):
+    path = delivery_slot_path(root, "ops")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        assert delivery_slot_held(root, "ops") is True
+    finally:
+        os.close(fd)
+    assert delivery_slot_held(root, "ops") is False
+
+
+def test_run_delivery_holds_delivery_slot_during_turn(root, tmp_path, monkeypatch):
+    """The runner holds the single-flight delivery slot for its WHOLE lifetime,
+    not just the turn window — so a second delivery to the same target bounces
+    instead of stacking a second waiter."""
+    home = root / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    dm = tmp_path / "dm.txt"
+    dm.write_text("hi", encoding="utf-8")
+    observed = {}
+
+    def _fake_run(argv, **kwargs):
+        # While the turn runs, the delivery slot must be held.
+        assert delivery_slot_held(home, "ops") is True
+        observed["argv"] = argv
+
+        class _P:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _P()
+
+    monkeypatch.setattr(bot_mode_dm.subprocess, "run", _fake_run)
+    rc = bot_mode_dm._run_delivery(["hermes", "-p", "ops", "chat"], str(dm), stdin_file=False)
+    assert rc == 0
+    assert observed["argv"][:3] == ["hermes", "-p", "ops"]
+    # …and after the runner exits, the slot is free again.
+    assert delivery_slot_held(home, "ops") is False

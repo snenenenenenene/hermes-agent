@@ -52,6 +52,12 @@ _LIVE_WAIT_SECONDS = 300
 # is "dispatched" and the receipt/notification carries the outcome. This is NOT a wait
 # for the recipient's reply — that still arrives as a completion notification.
 _ADMISSION_WAIT_FALLBACK = 15.0
+# Bound on ONE local delivery turn (``hermes -p <profile> chat -Q --query-file``).
+# A single chat turn is one model round-trip; anything still running past this is
+# stuck (the CLI's own self-paced loop can back off to 900s, which is exactly the
+# stall that left waiters alive for an hour). Two attempts (the one policy-gated
+# retry) still cap at 240s — far below the 900s stall this replaces.
+_DELIVERY_TURN_TIMEOUT_SECONDS = 120
 
 # '<peer>/<agent>' — peer names are lowercase (``hermes peer`` normalizes them).
 _PEER_TARGET_RE = re.compile(r"^([a-z0-9][a-z0-9_-]{0,63})/([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})$")
@@ -395,24 +401,76 @@ def _write_dm_file(content: str) -> str:
     return path
 
 
+def _delivery_lock_profile(argv: list[str], *, stdin_file: bool) -> Optional[str]:
+    """The target profile a LOCAL delivery serializes on, or None when no lock applies
+    (peer/relay transport, or argv that is not ``hermes -p <profile> …``).
+
+    Match the CLI element by basename: argv[0] may be an absolute venv path
+    (service contexts lack PATH) and carries .exe on Windows; split on both separators
+    so the shape matches regardless of which platform built the argv. See #93590.
+    """
+    cli = (argv[0] if argv else "").rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+    if stdin_file or len(argv) < 3 or cli not in ("hermes", "hermes.exe") or argv[1] != "-p":
+        return None
+    return argv[2]
+
+
 def _delivery_lock(argv: list[str], *, stdin_file: bool):
     """Per-profile turn lock for a LOCAL teammate delivery: local and relay deliveries
     into one profile both run a Bot Chat turn here, so the turn window is serialized on
     ``tools.bot_relay``'s cross-process lock. Peer transports (stdin mode) are locked
     on the remote gateway by its own deliver path.
 
+    Non-blocking: a busy target answers ``target_busy`` immediately rather than
+    queueing for ``turn_wait_seconds`` (the old behaviour stacked detached waiters
+    behind a busy profile). The single-flight delivery slot already bounds the
+    local-runner count; the turn lock still serializes against a concurrent relay
+    deliver RPC turn.
+
     See #93091.
     """
-    # Match the CLI element by basename: argv[0] may be an absolute venv path
-    # (service contexts lack PATH) and carries .exe on Windows; split on both separators.
-    # Split on both separators so the shape matches regardless of which platform built the argv. See #93590.
-    cli = (argv[0] if argv else "").rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
-    if stdin_file or len(argv) < 3 or cli not in ("hermes", "hermes.exe") or argv[1] != "-p":
+    profile = _delivery_lock_profile(argv, stdin_file=stdin_file)
+    if profile is None:
         return contextlib.nullcontext()
     from tools.bot_mode_probe import _hermes_root
     from tools.bot_relay import acquire_turn_lock
 
-    return acquire_turn_lock(_hermes_root(Path(_default_home())), argv[2])
+    return acquire_turn_lock(_hermes_root(Path(_default_home())), profile, timeout_seconds=0.0)
+
+
+def _delivery_slot(argv: list[str], *, stdin_file: bool):
+    """Single-flight slot for a LOCAL delivery's WHOLE runner lifetime.
+
+    The turn lock only covers the turn window, so two waiters could still both be
+    alive (one running its turn, the next queued behind it). This slot is held from
+    runner start to runner exit, so a second delivery to the same target fails fast
+    instead of stacking a second waiter. flock release-on-death is the stale-lock
+    recovery: a killed runner cannot wedge the target.
+    """
+    profile = _delivery_lock_profile(argv, stdin_file=stdin_file)
+    if profile is None:
+        return contextlib.nullcontext()
+    from tools.bot_mode_probe import _hermes_root
+    from tools.bot_relay import acquire_delivery_slot
+
+    return acquire_delivery_slot(_hermes_root(Path(_default_home())), profile)
+
+
+def _delivery_slot_busy(argv: list[str], *, stdin_file: bool) -> bool:
+    """True when another delivery runner already holds ``profile``'s single-flight slot.
+
+    The sender probes this BEFORE spawning so a second delivery to a busy target
+    answers ``target_busy`` without ever starting a second waiter; the runner's own
+    :func:`_delivery_slot` remains the authoritative backstop against the probe→spawn
+    race.
+    """
+    profile = _delivery_lock_profile(argv, stdin_file=stdin_file)
+    if profile is None:
+        return False
+    from tools.bot_mode_probe import _hermes_root
+    from tools.bot_relay import delivery_slot_held
+
+    return delivery_slot_held(_hermes_root(Path(_default_home())), profile)
 
 
 def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, str]] = None,
@@ -435,9 +493,18 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
 
     def _turn(turn_env=env):
         return subprocess.run([*argv, "--query-file", dm_file], check=False, stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, env=turn_env)
+                              capture_output=True, text=True, env=turn_env,
+                              timeout=_DELIVERY_TURN_TIMEOUT_SECONDS)
 
-    proc = _turn()
+    try:
+        proc = _turn()
+    except subprocess.TimeoutExpired:
+        # A turn that outlives its bounded budget is stuck (the CLI's own self-paced
+        # loop can stall for minutes): report a typed refusal so the runner writes the
+        # receipt and exits — never a waiter left behind, and never a 900s hold.
+        return 1, "delivery_timeout", (
+            f"delivery turn timed out after {_DELIVERY_TURN_TIMEOUT_SECONDS}s — "
+            "the target did not answer in a bounded chat turn."), ""
     if proc.returncode != 0:
         from tools.bot_failure_reasons import RETRY_NONE, classify_agent_error, retry_action, turn_failure_text
         from tools.bot_relay import retry_turn_env
@@ -445,7 +512,12 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
         # The re-run replays the same session and payload; the failed attempt already persisted the
         # user row, so the retried process is told to resume it (RESUME_UNANSWERED_TURN_ENV).
         if retry_action(classify_agent_error(turn_failure_text(proc.stdout, proc.stderr))) != RETRY_NONE:
-            proc = _turn(retry_turn_env(env))
+            try:
+                proc = _turn(retry_turn_env(env))
+            except subprocess.TimeoutExpired:
+                return 1, "delivery_timeout", (
+                    f"delivery turn timed out again after {_DELIVERY_TURN_TIMEOUT_SECONDS}s on retry — "
+                    "the message was NOT delivered."), ""
     stderr_text = proc.stderr or ""
     reason = next((line.removeprefix("hermes-refusal-reason: ").strip()
                    for line in stderr_text.splitlines()
@@ -532,8 +604,10 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
                   delivery_id: Optional[str] = None) -> int:
     """Route to the live owner before attempting a CLI transport. Live deliveries
     retain their intent/payload and immutable receipt; only CLI/peer payloads are
-    removed after consumption. The CLI turn window holds the profile lock, so two
-    deliveries into one profile queue; a bounded wait ends in a 'target_busy' refusal.
+    removed after consumption. The CLI turn window holds the profile turn lock and the
+    runner holds the single-flight delivery slot for its WHOLE lifetime, so two
+    deliveries into one profile never stack: a busy target answers 'target_busy'
+    immediately.
     ``author`` rides to the child as HERMES_TURN_AUTHOR; ``hermes peer dm`` forwards it in the request body.
 
     Every exit path here writes this delivery's terminal receipt in the home where
@@ -569,31 +643,33 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
 
         env = delivery_env(author, profile_home if not stdin_file else None)
         try:
-            with _delivery_lock(argv, stdin_file=stdin_file):
-                if not stdin_file:
-                    code, refusal, error, reply = _run_local_turn(argv, dm_file, env=env,
-                                                                  delivery_id=delivery_id)
-                    # Receipt BEFORE the reply is re-emitted: the outcome of the delivery
-                    # must not depend on a stdout pipe that the sender may already have
-                    # closed (the runner outlives the sender's turn).
-                    _record_cli_outcome(receipt_home, delivery_id, dm_file, code=code,
-                                        refusal=refusal, error=error, since=started)
-                    _emit_turn_output(code, refusal, error, reply, argv)
+            with _delivery_slot(argv, stdin_file=stdin_file):
+                with _delivery_lock(argv, stdin_file=stdin_file):
+                    if not stdin_file:
+                        code, refusal, error, reply = _run_local_turn(argv, dm_file, env=env,
+                                                                      delivery_id=delivery_id)
+                        # Receipt BEFORE the reply is re-emitted: the outcome of the delivery
+                        # must not depend on a stdout pipe that the sender may already have
+                        # closed (the runner outlives the sender's turn).
+                        _record_cli_outcome(receipt_home, delivery_id, dm_file, code=code,
+                                            refusal=refusal, error=error, since=started)
+                        _emit_turn_output(code, refusal, error, reply, argv)
+                        return code
+                    # Keep the file open until the transport exits; cleanup occurs
+                    # after subprocess.run returns, not merely after stdin reaches EOF.
+                    with open(dm_file, "r", encoding="utf-8") as stream:
+                        code = subprocess.run(argv, stdin=stream, check=False, env=env).returncode
+                    if code != 0 and receipt_home is not None:
+                        # Where the target lives on another install its admission is not
+                        # observable here: record the transport's own verdict by its exit code.
+                        _receipt_write(receipt_home, delivery_id, status="bounced", reason="peer_transport_failed",
+                                       error=f"the peer transport exited {code}")
                     return code
-                # Keep the file open until the transport exits; cleanup occurs
-                # after subprocess.run returns, not merely after stdin reaches EOF.
-                with open(dm_file, "r", encoding="utf-8") as stream:
-                    code = subprocess.run(argv, stdin=stream, check=False, env=env).returncode
-                if code != 0 and receipt_home is not None:
-                    # Where the target lives on another install its admission is not
-                    # observable here: record the transport's own verdict by its exit code.
-                    _receipt_write(receipt_home, delivery_id, status="bounced", reason="peer_transport_failed",
-                                   error=f"the peer transport exited {code}")
-                return code
         except TurnBusyError as exc:
-            # A queued delivery that ran out its budget behind another turn: the message
-            # was never handed to the target, so this is a bounce with a reason — the
-            # exact case that used to answer `sent` and bounce minutes later.
+            # A delivery refused because the target was busy (single-flight slot already held,
+            # or a turn already running): the message was never handed to the target, so this
+            # is a bounce with a reason — the exact case that used to answer `sent` and bounce
+            # minutes later (or stack another waiter).
             _receipt_write(receipt_home, delivery_id, status="bounced", reason="target_busy", error=str(exc))
             raise
     finally:
@@ -853,6 +929,20 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
             elif notification.get("process_id"):
                 result["process_id"] = notification["process_id"]
             return json.dumps(result)
+    # Single-flight: a LOCAL target with a delivery already in flight answers
+    # target_busy NOW instead of stacking a second detached waiter behind the first
+    # (a busy target used to accumulate waiters without a ceiling). The live branch
+    # above returns first, so this probe only gates the CLI turn path.
+    if _delivery_slot_busy(argv, stdin_file=stdin_file):
+        _unlink_dm_file(dm_file)
+        return json.dumps({
+            "status": "bounced",
+            "to": label,
+            "error": (f"Delivery to {label} was NOT started: another delivery to the same "
+                      "target is already in flight — wait for its completion notification "
+                      "before trying again."),
+            "reason": "target_busy",
+        })
     try:
         command = _delivery_command(argv, dm_file, stdin_file=stdin_file, profile_home=profile_home,
                                     author=author, delivery_id=delivery_id)

@@ -5,12 +5,14 @@ canonical Bot Chat session on a Bot-Mode-managed install, and must refuse to
 deliver from anywhere else even if a schema leaks.
 """
 
+import fcntl
 import json
 import os
 import shlex
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -361,7 +363,7 @@ def test_friendly_names_and_desktop_slugs_resolve_to_folder_ids(tmp_path, monkey
 
     result = json.loads(bot_mode_dm.message_agent_tool(target=target, message="ping", agent=_FakeAgent(home)))
 
-    assert result["status"] == "sent", result
+    assert result["status"] == "dispatched", result
     assert result["to"] == f"@{expected}"
     _mode, _dm_file, argv = _runner_parts(calls[0]["command"])
     assert argv[1:3] == ["-p", expected]
@@ -503,14 +505,14 @@ def test_renamed_primary_signs_with_its_friendly_name_and_is_reachable_by_it(tmp
     (home / "profile.yaml").write_text("display_name: Maia\n", encoding="utf-8")
 
     result = json.loads(bot_mode_dm.message_agent_tool(target="coder", message="hi", agent=_FakeAgent(home)))
-    assert result["status"] == "sent"
+    assert result["status"] == "dispatched"
     _mode, dm_file, _argv = _runner_parts(calls[0]["command"])
     assert Path(dm_file).read_text(encoding="utf-8").startswith("Message from 🤖 Maia (@hermes): ")
 
     coder = _FakeAgent(home / "profiles" / "coder")
     for target in ("maia", "@maia", "@hermes"):
         result = json.loads(bot_mode_dm.message_agent_tool(target=target, message="pong", agent=coder))
-        assert result["status"] == "sent", (target, result)
+        assert result["status"] == "dispatched", (target, result)
         _mode, _dm_file, argv = _runner_parts(calls[-1]["command"])
         assert argv[1:3] == ["-p", "default"], (target, argv)
 
@@ -1177,3 +1179,57 @@ def test_relay_waiter_that_cannot_start_reports_queued_not_failed(tmp_path, monk
     assert "Do NOT resend" in result["detail"]
     assert "approval" in result["notification_error"]
     assert list((bot_relay.relay_root(root) / bot_relay.OUTBOX_DIR).glob("*.json")), "envelope still queued"
+
+
+# ── single-flight delivery slot (delivery-ceiling regression) ───────────────
+
+
+def _hold_flock(path, hold_event, release_event):
+    """Grab ``path`` on a separate fd (same flock semantics as a live delivery
+    runner holding its single-flight slot), signal, and hold until released."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    hold_event.set()
+    release_event.wait(timeout=10)
+    os.close(fd)  # close releases the flock — process-death semantics
+
+
+def test_second_delivery_to_busy_target_does_not_spawn_second_waiter(tmp_path, monkeypatch):
+    """Single-flight: a target with a delivery already in flight answers
+    ``target_busy`` and does NOT spawn a second detached waiter.
+
+    Regression for the delivery-ceiling bug: a bounce used to make the sender
+    start another waiter, so a busy target accumulated waiters without a
+    ceiling. The sender now probes the target's single-flight slot before
+    spawning; the probe is a real flock on the slot file (not a mock of the
+    new function), so the spawn count stays at one.
+    """
+    from tools.bot_relay import delivery_slot_path
+
+    calls = _capture_spawn(monkeypatch)
+    monkeypatch.setattr(bot_relay, "_hermes_cli", lambda: "hermes")
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    agent = _FakeAgent(home, title="Bot Chat")
+
+    first = json.loads(bot_mode_dm.message_agent_tool(target="researcher", message="one", agent=agent))
+    assert first["status"] == "dispatched"
+    assert len(calls) == 1
+
+    # The first delivery's runner is now "in flight": hold its single-flight slot
+    # exactly as a live runner does (flock on the same slot file).
+    held = threading.Event()
+    release = threading.Event()
+    slot = delivery_slot_path(home, "researcher")
+    t = threading.Thread(target=_hold_flock, args=(slot, held, release))
+    t.start()
+    assert held.wait(timeout=5)
+    try:
+        second = json.loads(bot_mode_dm.message_agent_tool(target="researcher", message="two", agent=agent))
+        assert second["status"] == "bounced", second
+        assert second["reason"] == "target_busy"
+        assert len(calls) == 1, "a busy target must not spawn a second waiter"
+    finally:
+        release.set()
+        t.join(timeout=5)

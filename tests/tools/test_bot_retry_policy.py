@@ -261,7 +261,7 @@ def test_deliver_retry_reads_the_stream_the_cli_writes_and_resumes_the_persisted
     assert out["error"]["data"]["reason"] == bfr.PROVIDER_SERVER_ERROR
 
 
-def test_run_local_turn_retry_reads_the_stream_the_cli_writes_and_resumes_the_persisted_row(monkeypatch, tmp_path, capsys):
+def test_run_local_turn_retry_reads_the_stream_the_cli_writes_and_resumes_the_persisted_row(monkeypatch, tmp_path):
     """Same invariant on the same-install `message_agent` runner: the real stdout/stderr split opens
     the retry gate once, and only the re-run carries the resume marker (the first attempt's env is
     otherwise kept)."""
@@ -279,8 +279,9 @@ def test_run_local_turn_retry_reads_the_stream_the_cli_writes_and_resumes_the_pe
         return _Proc(0, stdout="the reply text")
 
     monkeypatch.setattr(bot_mode_dm.subprocess, "run", _fake_run)
-    rc = bot_mode_dm._run_local_turn(["hermes", "-p", "ops", "chat"], str(dm), env={"HERMES_HOME": str(tmp_path)})
-    assert rc == 0
+    code, refusal, error, reply = bot_mode_dm._run_local_turn(
+        ["hermes", "-p", "ops", "chat"], str(dm), env={"HERMES_HOME": str(tmp_path)}
+    )
+    assert (code, refusal, error, reply) == (0, None, "", "the reply text")
     assert envs[0] == {"HERMES_HOME": str(tmp_path)}
     assert envs[1] == {"HERMES_HOME": str(tmp_path), RESUME_UNANSWERED_TURN_ENV: "1"}
-    assert "the reply text" in capsys.readouterr().out

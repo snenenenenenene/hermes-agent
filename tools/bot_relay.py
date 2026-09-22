@@ -541,3 +541,75 @@ def acquire_turn_lock(root: Path | str, profile: str, timeout_seconds: float | N
                 fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
+
+
+def delivery_slot_path(root: Path | str, profile: str) -> Path:
+    """Per-profile single-flight lockfile for the detached delivery runner.
+
+    Distinct from :func:`turn_lock_path` (which serializes only the turn *window*):
+    this one is held for the runner's whole lifetime, so a second delivery to a
+    busy target fails fast instead of stacking a second waiter behind the first.
+    Same short-name rule as the turn lock.
+    """
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", str(profile or ""))[:64] or "_"
+    return relay_root(root) / LOCKS_DIR / f"{safe}.slot.lock"
+
+
+@contextlib.contextmanager
+def acquire_delivery_slot(root: Path | str, profile: str) -> Iterator[Path]:
+    """Non-blocking single-flight guard on ``profile``'s delivery rail.
+
+    Raises :class:`TurnBusyError` (reason ``'target_busy'``, waited ~0s) when another
+    runner already holds the slot. flock is released by the kernel when the holder's
+    fd closes — SIGKILL included — so a killed waiter can never wedge the target: that
+    release-on-death is the whole stale-lock recovery (no pid file, no sweep).
+    """
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover — Windows
+        logger.debug("bot delivery slot disabled: fcntl unavailable on this platform")
+        yield delivery_slot_path(root, profile)
+        return
+
+    path = delivery_slot_path(root, profile)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise TurnBusyError(profile, 0.0)
+        try:
+            yield path
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def delivery_slot_held(root: Path | str, profile: str) -> bool:
+    """Non-blocking probe: is ``profile``'s delivery slot held right now?
+
+    The sender calls this *before* spawning a runner so a second delivery answers
+    ``target_busy`` without ever starting a second waiter; the runner's own
+    :func:`acquire_delivery_slot` remains the authoritative guard against the
+    probe→spawn TOCTOU race.
+    """
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover — Windows
+        return False
+    path = delivery_slot_path(root, profile)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
