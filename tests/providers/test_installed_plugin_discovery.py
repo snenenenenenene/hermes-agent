@@ -76,3 +76,12 @@ def test_other_plugins_in_the_flat_directory_are_left_to_the_plugin_manager(herm
 
     assert not [p for p in list_providers() if p.name in ("other-standalone", "manifestless", "broken-manifest")]
     assert get_provider_profile("copilot-acp") is not None  # bundled set still intact
+
+
+def test_disabled_flat_model_provider_is_not_imported(hermes_home, monkeypatch):
+    _write_plugin(hermes_home / "plugins" / "disabled-acp", name="disabled-acp",
+                  manifest="name: disabled-acp\nkind: model-provider\n")
+    monkeypatch.setattr("hermes_cli.plugins._get_disabled_plugins", lambda: {"disabled-acp"})
+    from providers import get_provider_profile
+
+    assert get_provider_profile("disabled-acp") is None

@@ -412,11 +412,19 @@ def _discover_providers() -> None:
     #     other plugin in this directory belongs to PluginManager.
     installed_dir = _installed_plugins_dir()
     if installed_dir is not None:
+        try:
+            from hermes_cli.plugins import _get_disabled_plugins
+
+            disabled_plugins = _get_disabled_plugins()
+        except Exception:
+            disabled_plugins = set()
         for child in sorted(installed_dir.iterdir()):
             if not child.is_dir() or child.name.startswith(("_", ".")):
                 continue
             if child.name == "model-providers":
                 continue  # handled by step 2
+            if child.name in disabled_plugins:
+                continue
             if not _declares_model_provider_kind(child):
                 continue
             _import_plugin_dir(child, "user")
