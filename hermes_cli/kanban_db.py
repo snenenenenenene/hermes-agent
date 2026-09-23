@@ -316,6 +316,11 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
     return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
 
 
+def _resolve_blocker_cooldown_seconds() -> int:
+    """``HERMES_KANBAN_BLOCKER_COOLDOWN_SECONDS`` (0 = next tick, for tests) else default."""
+    return _env_int("HERMES_KANBAN_BLOCKER_COOLDOWN_SECONDS", DEFAULT_BLOCKER_COOLDOWN_SECONDS)
+
+
 # build_worker_context() caps, sized for a ~100k-char prompt with headroom.
 _CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
 _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
@@ -4250,6 +4255,7 @@ from hermes_cli.kanban_db_workspace import (  # noqa: E402
     _scratch_workspace,
 )
 from hermes_cli.kanban_db_dispatch import (  # noqa: E402
+    DEFAULT_BLOCKER_COOLDOWN_SECONDS,
     DEFAULT_FAILURE_LIMIT,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     DispatchResult,

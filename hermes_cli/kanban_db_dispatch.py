@@ -70,6 +70,16 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# Cooldown after a quota/auth blocker stamp (``last_failure_error`` matching
+# ``_RESPAWN_BLOCKER_RE``) before re-spawning. The stamp carries no timestamp,
+# so the age is measured from the task's newest terminal run
+# (``task_runs.ended_at``). A transient 402 "Insufficient Balance" must not
+# freeze the queue forever: once this window elapses the hold releases and the
+# dispatcher retries the card once. A fresh failure re-stamps the error and
+# re-arms the hold, so this can never tight-loop. Overridable via
+# ``HERMES_KANBAN_BLOCKER_COOLDOWN_SECONDS``.
+DEFAULT_BLOCKER_COOLDOWN_SECONDS = 1800  # 30 minutes
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -1370,6 +1380,25 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _blocker_stamp_age_seconds(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[int]:
+    """Age in seconds of the stamped quota/auth blocker, measured from the
+    task's newest terminal run (``task_runs.ended_at``); None when there is no
+    such run. ``last_failure_error`` carries no timestamp, so the newest ended
+    run is the clock.
+    """
+    row = conn.execute(
+        "SELECT ended_at FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["ended_at"] is None:
+        return None
+    return int(time.time()) - int(row["ended_at"])
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1380,7 +1409,9 @@ def check_respawn_guard(
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
     path never increments ``consecutive_failures``), ``"blocker_auth"``
-    (quota/auth pattern; the breaker still trips eventually), then for the
+    (quota/auth pattern, held for ``DEFAULT_BLOCKER_COOLDOWN_SECONDS`` measured
+    from the newest terminal run — a transient 402 "Insufficient Balance" must
+    not freeze the queue forever), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR). The review
@@ -1418,9 +1449,21 @@ def check_respawn_guard(
         # (spaced by the cooldown) until quota returns or a real run supersedes it.
         return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.
+    # 2. Quota / auth blocker: a cooldown hold, not a life sentence. A transient
+    #    402 (e.g. "Insufficient Balance") stamps ``last_failure_error`` with
+    #    billing-flavored text matching ``_RESPAWN_BLOCKER_RE``; holding forever
+    #    would freeze the queue. Hold for ``DEFAULT_BLOCKER_COOLDOWN_SECONDS``
+    #    from the newest terminal run, then release so the dispatcher retries the
+    #    card once. A fresh failure re-stamps the error and re-arms the hold, so
+    #    this can never tight-loop.
     err = row["last_failure_error"]
     if err and _RESPAWN_BLOCKER_RE.search(err):
+        blocker_cooldown = _kb._resolve_blocker_cooldown_seconds()
+        if blocker_cooldown <= 0:
+            return None
+        stamp_age = _blocker_stamp_age_seconds(conn, task_id)
+        if stamp_age is None or stamp_age >= blocker_cooldown:
+            return None
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
@@ -1823,16 +1866,24 @@ def _dispatch_lane_task(
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
-        # Event so ``hermes kanban tail`` shows why the task looks stuck.
-        # Honour kanban.default_assignee: when the dispatcher hits an unassigned ready task and an
-        # operator-configured fallback exists, persist the assignment and proceed. This removes the
-        # dashboard footgun where a task created without an assignee parks in 'ready' forever even though
-        # the operator's intent ("default") was perfectly clear (#27145). Mutating the row (not just the
-        # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
-        # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
+        # Event so ``hermes kanban tail`` shows why the task looks stuck. A held
+        # card can sit on the same guard for many ticks; append only when the
+        # task's newest event is not already an identical ``respawn_guarded``
+        # with the same reason, so the event table does not grow one row per tick.
         if not dry_run:
             with _kb.write_txn(conn):
-                _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+                latest = conn.execute(
+                    "SELECT kind, payload FROM task_events "
+                    "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                already = (
+                    latest is not None
+                    and latest["kind"] == "respawn_guarded"
+                    and _kb._json_dict(latest["payload"]).get("reason") == guard_reason
+                )
+                if not already:
+                    _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
 
     def _count_spawn(name: str) -> None:

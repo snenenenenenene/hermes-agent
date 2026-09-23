@@ -570,6 +570,109 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+def _seed_blocker_held_task(
+    conn: sqlite3.Connection,
+    *,
+    title: str = "blocker-held",
+    assignee: str = "alice",
+    ended_at: int,
+    error: str = "worker exited: 402 Insufficient Balance (billing)",
+) -> str:
+    """Create a ready task whose newest terminal run ended at ``ended_at`` and
+    whose ``last_failure_error`` matches ``_RESPAWN_BLOCKER_RE`` — the exact
+    shape a transient 402 crash leaves behind."""
+    tid = kb.create_task(conn, title=title, assignee=assignee)
+    kb.claim_task(conn, tid)
+    run_id = kb.get_task(conn, tid).current_run_id
+    conn.execute(
+        "UPDATE task_runs SET outcome='failed', status='failed', ended_at=? "
+        "WHERE id=?",
+        (ended_at, run_id),
+    )
+    conn.execute(
+        "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+        "claim_expires=NULL, worker_pid=NULL, last_failure_error=? WHERE id=?",
+        (error, tid),
+    )
+    conn.commit()
+    return tid
+
+
+def test_respawn_guard_blocker_auth_is_cooldown_not_life_sentence(
+    kanban_home, monkeypatch,
+):
+    """A fresh blocker stamp holds the card; a stamp older than the cooldown is
+    released so the dispatcher retries it once (a transient 402 must not freeze
+    the queue forever)."""
+    import hermes_cli.kanban_db as _kb
+
+    now = 5_000_000
+    monkeypatch.setenv("HERMES_KANBAN_BLOCKER_COOLDOWN_SECONDS", "1800")
+
+    with kbc.connect() as conn:
+        tid = _seed_blocker_held_task(conn, ended_at=now)
+
+        # Fresh stamp → still held.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 10)
+        assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
+
+        # Stamp older than the cooldown → released.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 2000)
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
+def test_respawn_guard_blocker_cooldown_zero_releases_immediately(
+    kanban_home, monkeypatch,
+):
+    """``HERMES_KANBAN_BLOCKER_COOLDOWN_SECONDS=0`` releases the hold on the
+    next tick."""
+    import hermes_cli.kanban_db as _kb
+
+    now = 5_000_000
+    monkeypatch.setenv("HERMES_KANBAN_BLOCKER_COOLDOWN_SECONDS", "0")
+
+    with kbc.connect() as conn:
+        tid = _seed_blocker_held_task(conn, ended_at=now)
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 10)
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
+def test_respawn_guarded_event_deduped_across_dispatch_ticks(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """Two consecutive dispatch ticks over a freshly stamped held card append
+    exactly one ``respawn_guarded`` event, while ``result.respawn_guarded``
+    still lists the card on both ticks."""
+    import hermes_cli.kanban_db as _kb
+
+    now = 5_000_000
+    monkeypatch.setenv("HERMES_KANBAN_BLOCKER_COOLDOWN_SECONDS", "1800")
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kbc.connect() as conn:
+        tid = _seed_blocker_held_task(conn, ended_at=now)
+
+        for _tick in (1, 2):
+            monkeypatch.setattr(_kb.time, "time", lambda: now + 10)
+            res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+            assert (tid, "blocker_auth") in res.respawn_guarded, (
+                f"tick {_tick} must list the held card"
+            )
+
+        assert spawns == []
+
+        events = conn.execute(
+            "SELECT id FROM task_events "
+            "WHERE task_id = ? AND kind = 'respawn_guarded'",
+            (tid,),
+        ).fetchall()
+        assert len(events) == 1, f"expected one respawn_guarded event, got {len(events)}"
+
+
 
 
 
