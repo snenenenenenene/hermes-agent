@@ -51,6 +51,11 @@ DESKTOP_DELIVER_TIMEOUT_SECONDS = (
 )
 # The Desktop posts its own timeout reply at that deadline, so the waiter must still be watching then.
 REPLY_WAIT_SECONDS = DESKTOP_DELIVER_TIMEOUT_SECONDS + 60
+# The delivery slot's exclusive acquire retries for this long before refusing. It exists only to
+# absorb the microseconds a concurrent sender holds its SHARED probe lock on the same file — it is
+# NOT queueing: a slot a real runner holds still refuses inside a quarter of a second.
+_SLOT_PROBE_GRACE_SECONDS = 0.25
+_SLOT_PROBE_POLL_SECONDS = 0.01
 # Envelopes/replies older than this are stale artifacts (Desktop closed) and are swept.
 STALE_AFTER_SECONDS = 6 * 3600
 # Only a recent roster is authoritative for the fail-fast offline check: the
@@ -557,10 +562,14 @@ def delivery_slot_path(root: Path | str, profile: str) -> Path:
 
 @contextlib.contextmanager
 def acquire_delivery_slot(root: Path | str, profile: str) -> Iterator[Path]:
-    """Non-blocking single-flight guard on ``profile``'s delivery rail.
+    """Single-flight guard on ``profile``'s delivery rail — the one authority on the slot.
 
-    Raises :class:`TurnBusyError` (reason ``'target_busy'``, waited ~0s) when another
-    runner already holds the slot. flock is released by the kernel when the holder's
+    The exclusive flock (``LOCK_EX | LOCK_NB``) is retried for at most
+    ``_SLOT_PROBE_GRACE_SECONDS`` before raising :class:`TurnBusyError` (reason
+    ``'target_busy'``). That grace is not queueing: it exists only so a sender's
+    momentary SHARED probe lock (see :func:`delivery_slot_held`) cannot make a
+    legitimate runner refuse itself, and a slot a real runner holds still refuses
+    inside a quarter of a second. flock is released by the kernel when the holder's
     fd closes — SIGKILL included — so a killed waiter can never wedge the target: that
     release-on-death is the whole stale-lock recovery (no pid file, no sweep).
     """
@@ -575,10 +584,17 @@ def acquire_delivery_slot(root: Path | str, profile: str) -> Iterator[Path]:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            raise TurnBusyError(profile, 0.0)
+        start = time.monotonic()
+        deadline = start + _SLOT_PROBE_GRACE_SECONDS
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                now = time.monotonic()
+                if now >= deadline:
+                    raise TurnBusyError(profile, now - start)
+                time.sleep(min(_SLOT_PROBE_POLL_SECONDS, deadline - now))
         try:
             yield path
         finally:
@@ -589,12 +605,18 @@ def acquire_delivery_slot(root: Path | str, profile: str) -> Iterator[Path]:
 
 
 def delivery_slot_held(root: Path | str, profile: str) -> bool:
-    """Non-blocking probe: is ``profile``'s delivery slot held right now?
+    """Advisory non-blocking probe: is ``profile``'s delivery slot held right now?
+
+    The probe takes a SHARED lock (``LOCK_SH | LOCK_NB``), never the exclusive slot:
+    only a holder's exclusive lock can block a shared one, so an ``OSError`` means a
+    runner really holds the slot, while two senders probing the same idle target both
+    read "not held" (shared locks do not conflict with each other) and a probe in
+    flight can never make a runner's :func:`acquire_delivery_slot` fail.
 
     The sender calls this *before* spawning a runner so a second delivery answers
     ``target_busy`` without ever starting a second waiter; the runner's own
-    :func:`acquire_delivery_slot` remains the authoritative guard against the
-    probe→spawn TOCTOU race.
+    :func:`acquire_delivery_slot` stays the sole authority on the slot and the guard
+    against the probe→spawn TOCTOU race.
     """
     try:
         import fcntl
@@ -605,9 +627,9 @@ def delivery_slot_held(root: Path | str, profile: str) -> bool:
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except OSError:
-            return True
+            return True  # only a holder's exclusive lock can block a shared one
         with contextlib.suppress(OSError):
             fcntl.flock(fd, fcntl.LOCK_UN)
         return False

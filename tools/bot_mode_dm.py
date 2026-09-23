@@ -459,6 +459,10 @@ def _delivery_slot(argv: list[str], *, stdin_file: bool):
 def _delivery_slot_busy(argv: list[str], *, stdin_file: bool) -> bool:
     """True when another delivery runner already holds ``profile``'s single-flight slot.
 
+    Advisory only: the probe takes a SHARED flock and never the exclusive slot, so two
+    senders probing the same idle target both read "not held" and a probe in flight can
+    never make a runner's acquire refuse an idle target.
+
     The sender probes this BEFORE spawning so a second delivery to a busy target
     answers ``target_busy`` without ever starting a second waiter; the runner's own
     :func:`_delivery_slot` remains the authoritative backstop against the probe→spawn
@@ -932,7 +936,9 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
     # Single-flight: a LOCAL target with a delivery already in flight answers
     # target_busy NOW instead of stacking a second detached waiter behind the first
     # (a busy target used to accumulate waiters without a ceiling). The live branch
-    # above returns first, so this probe only gates the CLI turn path.
+    # above returns first, so this probe only gates the CLI turn path. The probe is a
+    # SHARED flock and never takes the slot, so it cannot collide with another sender's
+    # probe nor make the runner it is about to spawn refuse an idle target.
     if _delivery_slot_busy(argv, stdin_file=stdin_file):
         _unlink_dm_file(dm_file)
         return json.dumps({

@@ -380,6 +380,59 @@ def test_delivery_slot_held_probe_matches_acquire(root):
     assert delivery_slot_held(root, "ops") is False
 
 
+def test_delivery_slot_probe_does_not_collide_with_a_concurrent_probe(root):
+    """Two senders probing the same IDLE target must both read 'not held'.
+
+    The fd below holds exactly what a probe in flight holds — a shared lock. An
+    exclusive probe cannot take the file while it is there and would report the idle
+    target as busy, refusing a real message with nothing in flight.
+    """
+    path = delivery_slot_path(root, "ops")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_SH)  # a concurrent sender's probe, mid-flight
+    try:
+        assert delivery_slot_held(root, "ops") is False, (
+            "a concurrent probe made the idle target read as busy — the sender would "
+            "answer target_busy and drop a message with no delivery in flight"
+        )
+    finally:
+        os.close(fd)
+
+
+def test_acquire_delivery_slot_tolerates_a_probe_in_flight(root):
+    """A probe landing while the just-spawned runner acquires must not refuse it.
+
+    The sender has already answered; if the runner's acquire raises here, the message
+    is lost against an idle target.
+    """
+    path = delivery_slot_path(root, "ops")
+    probing = threading.Event()
+
+    def _hold_shared():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        probing.set()
+        time.sleep(0.05)  # the instant a probe holds its shared lock
+        os.close(fd)
+
+    t = threading.Thread(target=_hold_shared)
+    t.start()
+    assert probing.wait(timeout=5)
+    try:
+        with acquire_delivery_slot(root, "ops"):
+            pass
+    except TurnBusyError as err:  # pragma: no cover — the regression
+        pytest.fail(
+            "a sender's in-flight probe made the runner refuse its own acquire on an "
+            f"idle target ({err.reason}) — _start_delivery already answered the sender, "
+            "so that message is dropped with nothing in flight"
+        )
+    finally:
+        t.join(timeout=5)
+
+
 def test_run_delivery_holds_delivery_slot_during_turn(root, tmp_path, monkeypatch):
     """The runner holds the single-flight delivery slot for its WHOLE lifetime,
     not just the turn window — so a second delivery to the same target bounces
