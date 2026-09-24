@@ -202,6 +202,27 @@ def _live_fleet_covers_receipt(expected_sha: str | None, *, accept_states: tuple
         return False
 
 
+def _live_fleet_matches_checkout() -> bool:
+    """True when at least one live gateway exists and all serve the checkout."""
+    from hermes_cli.update_cmd import _current_checkout_sha
+
+    checkout_sha = _current_checkout_sha()
+    if not checkout_sha:
+        return False
+    try:
+        from hermes_cli.update_receipt import collect_fleet_versions
+        fleet = collect_fleet_versions()
+    except Exception as exc:
+        logger.debug("Could not compare live fleet with checkout: %s", exc)
+        return False
+    return bool(fleet) and all(
+        isinstance(row, dict)
+        and row.get("state") == "current"
+        and row.get("code_sha") == checkout_sha
+        for row in fleet
+    )
+
+
 def _read_fleet_marker_expected_sha() -> str:
     """``expected_sha`` recorded in the pending marker ("" when absent/unreadable)."""
     with suppress(OSError):
@@ -321,7 +342,6 @@ def _update_owes_fleet_restart() -> bool:
             return not _marker_only_restart_obsolete()
     if not _receipt_reports_stale_runtime():
         return False
-    from hermes_cli.update_cmd import _current_checkout_sha
     from hermes_cli.update_receipt import read_latest_receipt
     restarted_to = _receipt_restart_phase_completed(read_latest_receipt() or {})
     # A completed restart phase leaves nothing owed while the fleet serves either the code the
@@ -329,7 +349,8 @@ def _update_owes_fleet_restart() -> bool:
     # discharges the update (#113350 steps 3-4). A fleet on neither sha is genuinely stale.
     if restarted_to and _live_fleet_covers_receipt(restarted_to, accept_states=("current", "stale")):
         return False
-    return not _live_fleet_covers_receipt(_current_checkout_sha())
+    # The hint asks whether a live gateway serves other code; unvouchable serve/dashboard rows do not.
+    return not _live_fleet_matches_checkout()
 
 
 def _warn_pending_fleet_restart(*, startup: bool = False) -> None:

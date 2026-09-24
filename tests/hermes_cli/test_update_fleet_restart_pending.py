@@ -680,6 +680,67 @@ def test_startup_warn_silent_when_nothing_pending(capsys):
     assert captured.out == ""
 
 
+def _write_failed_mixed_runtime_receipt(stale_sha):
+    receipt_dir = get_hermes_home() / "logs" / "update_receipts"
+    receipt_dir.mkdir(parents=True)
+    (receipt_dir / "latest.json").write_text(
+        json.dumps(
+            {
+                "outcome": "failed",
+                "gateway_restart": {},
+                "fleet": [],
+                "plan": {
+                    "runtimes": [
+                        {"kind": kind, "profile": "default", "code_sha": stale_sha}
+                        for kind in ("gateway", "dashboard", "serve")
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_startup_warn_uses_live_rows_not_unvouchable_receipt_rows(monkeypatch, capsys):
+    checkout_sha = "e" * 40
+    _write_failed_mixed_runtime_receipt("d" * 40)
+    _patch_marker_sha(monkeypatch, checkout_sha)
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions",
+        lambda **kwargs: [{"profile": "default", "code_sha": checkout_sha, "state": "current"}],
+    )
+
+    update_cmd._warn_pending_fleet_restart_on_startup()
+
+    assert capsys.readouterr().err == ""
+    assert not update_cmd._fleet_restart_pending_marker_path().exists()
+
+
+def test_startup_warn_when_live_row_differs_from_checkout(monkeypatch, capsys):
+    checkout_sha = "e" * 40
+    _write_failed_mixed_runtime_receipt("d" * 40)
+    _patch_marker_sha(monkeypatch, checkout_sha)
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions",
+        lambda **kwargs: [{"profile": "default", "code_sha": "d" * 40, "state": "stale"}],
+    )
+
+    update_cmd._warn_pending_fleet_restart_on_startup()
+
+    assert "did not restart running gateways" in capsys.readouterr().err
+
+
+def test_startup_warn_when_no_live_rows(monkeypatch, capsys):
+    checkout_sha = "e" * 40
+    _write_failed_mixed_runtime_receipt("d" * 40)
+    _patch_marker_sha(monkeypatch, checkout_sha)
+    monkeypatch.setattr("hermes_cli.update_receipt.collect_fleet_versions", lambda **kwargs: [])
+
+    update_cmd._warn_pending_fleet_restart_on_startup()
+
+    assert "did not restart running gateways" in capsys.readouterr().err
+
+
 # ── Self-heal: marker left behind by a supervisor-level restart (#105417 / #111272) ──
 #
 # `systemctl --user restart hermes-gateway` never runs this module's clear path, and an update
@@ -806,14 +867,18 @@ def test_startup_warn_silent_when_failed_receipt_already_restarted_fleet(monkeyp
 
 
 @pytest.mark.parametrize(
-    "live_sha, missing_gateway, owes_restart",
-    [("c" * 40, False, False), ("d" * 40, False, True), ("c" * 40, True, True)],
+    "live_sha, missing_gateway, hint_owes_restart, pending_restart_needed",
+    [
+        ("c" * 40, False, False, False),
+        ("d" * 40, False, True, True),
+        ("c" * 40, True, False, True),
+    ],
     ids=["restarted-onto-checkout", "matches-neither-sha", "owed-gateway-down"],
 )
 def test_startup_warn_after_completed_restart_and_moved_checkout(
-    monkeypatch, capsys, live_sha, missing_gateway, owes_restart
+    monkeypatch, capsys, live_sha, missing_gateway, hint_owes_restart, pending_restart_needed
 ):
-    """A later restart clears the update debt only when every owed gateway is current.
+    """The hint judges live rows while the acting path covers every owed gateway.
 
     #113350 steps 3-4: the update pulled ``pulled`` and its restart phase completed, then the
     checkout moved to ``checkout`` and the operator restarted the gateways onto it. The receipt
@@ -848,13 +913,12 @@ def test_startup_warn_after_completed_restart_and_moved_checkout(
         ],
     )
 
-    assert update_cmd_fleet._update_owes_fleet_restart() is owes_restart
+    assert update_cmd_fleet._update_owes_fleet_restart() is hint_owes_restart
     update_cmd._warn_pending_fleet_restart_on_startup()
     captured = capsys.readouterr()
     assert captured.out == ""
-    if owes_restart:
+    if hint_owes_restart:
         assert "did not restart running gateways" in captured.err
     else:
         assert captured.err == ""
-    assert update_cmd_fleet._pending_fleet_restart_needed() is owes_restart
-
+    assert update_cmd_fleet._pending_fleet_restart_needed() is pending_restart_needed
