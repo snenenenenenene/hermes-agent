@@ -2215,6 +2215,27 @@ def _claim_and_open_run(
     return run_id
 
 
+def _reject_live_open_run(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Refuse a claim while any leaked open run still owns a live worker."""
+    rows = conn.execute(
+        "SELECT id, worker_pid, worker_started_at FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NULL AND worker_pid IS NOT NULL "
+        "ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        if not _worker_alive(row["worker_pid"], row["worker_started_at"]):
+            continue
+        payload = {
+            "reason": "live_run_row",
+            "run_id": int(row["id"]),
+            "worker_pid": int(row["worker_pid"]),
+        }
+        _append_event(conn, task_id, "claim_rejected", payload, run_id=int(row["id"]))
+        return True
+    return False
+
+
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
@@ -2228,6 +2249,8 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if _reject_live_open_run(conn, task_id):
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2261,6 +2284,8 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if _reject_live_open_run(conn, task_id):
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -2272,6 +2297,10 @@ def claim_review_task(
                     {"reason": "parent_reopened", "source_status": "review"},
                 )
             return None
+        _reclaim_dangling_run(
+            conn, task_id, statuses=("review",), now=now,
+            note="invariant recovery on review re-claim",
+        )
         run_id = _claim_and_open_run(
             conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},
         )
@@ -3423,10 +3452,10 @@ def _reclaim_dangling_run(
     ``current_run_id IS NULL <=> run row terminal`` holds; no-op normally."""
     placeholders = ", ".join("?" for _ in statuses)
     stale = conn.execute(
-        f"SELECT current_run_id FROM tasks WHERE id = ? AND status IN ({placeholders})",
+        f"SELECT 1 FROM tasks WHERE id = ? AND status IN ({placeholders})",
         (task_id, *statuses),
     ).fetchone()
-    if stale and stale["current_run_id"]:
+    if stale:
         conn.execute(
             """
             UPDATE task_runs
@@ -3434,9 +3463,9 @@ def _reclaim_dangling_run(
                    summary = COALESCE(summary, ?),
                    ended_at = ?,
                    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
-             WHERE id = ? AND ended_at IS NULL
+             WHERE task_id = ? AND ended_at IS NULL
             """,
-            (note, now, int(stale["current_run_id"])),
+            (note, now, task_id),
         )
 
 
