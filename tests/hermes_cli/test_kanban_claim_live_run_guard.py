@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
 
 
 @pytest.fixture
@@ -86,3 +88,30 @@ def test_reclaim_dangling_run_closes_every_open_row(conn):
         == ("reclaimed", "reclaimed", now, "test recovery")
         for row in rows
     )
+
+
+def test_orphaned_open_run_with_pr_comment_is_claimable(conn):
+    tid = kb.create_task(conn, title="resume PR", assignee="coder")
+    assert kb.claim_task(conn, tid, claimer="first") is not None
+    run_id = kb._current_run_id(conn, tid)
+    kb.add_comment(
+        conn, tid, author="coder",
+        body="Opened https://github.com/example/project/pull/123",
+    )
+    conn.execute(
+        "UPDATE tasks SET status = 'ready', claim_lock = NULL, claim_expires = NULL, "
+        "worker_pid = NULL, worker_started_at = NULL, current_run_id = NULL WHERE id = ?",
+        (tid,),
+    )
+    conn.commit()
+
+    task = kb.get_task(conn, tid)
+    open_run = kb.get_run(conn, run_id)
+    assert task.status == "ready" and task.current_run_id is None
+    assert open_run.status == "running" and open_run.ended_at is None
+    assert open_run.claim_expires > int(time.time())
+
+    assert kbd.check_respawn_guard(conn, tid) is None
+    claimed = kb.claim_task(conn, tid, claimer="second")
+    assert claimed is not None and claimed.status == "running"
+    assert kb.get_run(conn, run_id).outcome == "reclaimed"

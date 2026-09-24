@@ -1414,9 +1414,10 @@ def check_respawn_guard(
     not freeze the queue forever), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR). The review
-    lane skips the last two: they are the *inputs* to a review handoff. Stale /
-    dead claim locks are NOT a guard reason — the reclaim passes own those.
+    (PR URL in a recent comment; re-spawning risks a duplicate PR, unless an
+    orphaned open run needs recovery). The review lane skips the last two: they
+    are the *inputs* to a review handoff. Stale / dead claim locks are NOT a
+    guard reason — the reclaim passes own those.
     """
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
@@ -1501,6 +1502,15 @@ def check_respawn_guard(
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            # An open run reaching the ready lane is recovery work, not proof
+            # that the PR still has an owner. claim_task is the liveness gate: it
+            # rejects a live worker and reclaims dead / unowned run rows.
+            open_run = conn.execute(
+                "SELECT 1 FROM task_runs WHERE task_id = ? AND ended_at IS NULL LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if open_run:
+                return None
             return "active_pr"
 
     return None
