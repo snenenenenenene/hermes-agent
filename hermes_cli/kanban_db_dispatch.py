@@ -1268,6 +1268,14 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
+        # A card already handed off (review/done) must not be pulled back by
+        # implementer-run failure accounting (budget exhaustion after
+        # request_review). Review-lane runs (source_status=review) still count.
+        if row["status"] in ("review", "done"):
+            if _kb._retry_status_for_run(
+                conn, task_id, row["current_run_id"]
+            ) != "review":
+                return False
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim

@@ -65,6 +65,22 @@ def build_kanban_stop_nudge(
         return None
 
     tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
+    # Already handed off (review/done/blocked/...) — no nudge into a doomed loop.
+    # Probe only after the cheap checks above; DB/import errors fall through to
+    # today's nudge (never raise).
+    try:
+        from hermes_cli import kanban_db_connect as _kbc
+        # ``connect_closing``: sqlite3's own context manager commits but does not
+        # close the fd (see its docstring), and this runs once per worker turn end.
+        with _kbc.connect_closing() as conn:
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (tid,),
+            ).fetchone()
+            if row is not None and row["status"] != "running":
+                return None
+    except Exception:
+        pass
+
     return (
         "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
         "terminal state for the board.\n\n"

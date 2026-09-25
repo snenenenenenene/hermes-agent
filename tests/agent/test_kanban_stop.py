@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from agent.kanban_stop import (
@@ -16,6 +18,18 @@ def clear_kanban_env(monkeypatch):
     for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_STOP_NUDGE"):
         monkeypatch.delenv(var, raising=False)
     return monkeypatch
+
+
+@pytest.fixture
+def kanban_board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Isolated HERMES_HOME with an empty kanban DB for board-status probes."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    from hermes_cli import kanban_db as kb
+    kb.init_db()
+    return home
 
 
 
@@ -98,8 +112,53 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+def test_no_nudge_when_card_already_in_review(clear_kanban_env, kanban_board):
+    """Worker handed off via request_review — stop guard must close quietly."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="handed off", assignee="worker")
+        kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="done",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "review"
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", tid)
+    assert build_kanban_stop_nudge(messages=[]) is None
 
 
+def test_nudge_when_card_still_running(clear_kanban_env, kanban_board):
+    """Card still in running — today's nudge still fires."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="still working", assignee="worker")
+        kb.claim_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "running"
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", tid)
+    nudge = build_kanban_stop_nudge(messages=[])
+    assert nudge is not None
+    assert "kanban_complete" in nudge
+
+
+def test_nudge_when_board_db_unavailable(clear_kanban_env, monkeypatch):
+    """DB/import errors fall back to today's nudge — never raise."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_orphan")
+
+    def _boom():
+        raise OSError("kanban.db unavailable")
+
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db_connect.connect", _boom,
+    )
+    nudge = build_kanban_stop_nudge(messages=[])
+    assert nudge is not None
+    assert "kanban_complete" in nudge
 
 
 # ── Integration: agent nudge + dispatcher bounded retry ──────────────
@@ -108,7 +167,3 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
 # without a terminal call, the dispatcher's bounded retry (streak of 3)
 # handles it.  See also tests/hermes_cli/test_kanban_core_functionality.py
 # for the dispatcher-side streak tests.
-
-
-
-

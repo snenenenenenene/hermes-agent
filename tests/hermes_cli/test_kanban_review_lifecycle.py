@@ -812,3 +812,156 @@ def test_synthesized_run_for_unassigned_card_keeps_null_profile(kanban_home: Pat
             "SELECT profile, outcome FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1", (tid,),
         ).fetchone()
         assert (run["outcome"], run["profile"]) == ("blocked", None)
+
+
+# ---------------------------------------------------------------------------
+# Handed-off cards must not be re-queued by implementer-run failure accounting
+# ---------------------------------------------------------------------------
+
+
+def _failures(conn, tid: str) -> int:
+    return int(conn.execute(
+        "SELECT consecutive_failures FROM tasks WHERE id = ?", (tid,),
+    ).fetchone()[0])
+
+
+def test_budget_exhaustion_after_request_review_does_not_leave_review(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Incident t_02fe5e52: worker handed off via request_review, then the
+    stop-nudge loop burned the iteration budget; ``_record_task_failure``
+    must not pull the card out of review into blocked/ready."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    spawned: list[str] = []
+
+    def _spawn(task, workspace, board=None):
+        spawned.append(task.id)
+        return 4242
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="handoff then budget", assignee="worker", max_retries=1,
+        )
+        kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="done",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "review"
+        failures_before = _failures(conn, tid)
+
+        tripped = kbd._record_task_failure(
+            conn, tid,
+            error=(
+                "Iteration budget exhausted (60/60) — task could not "
+                "complete within the allowed iterations"
+            ),
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+            event_payload_extra={"budget_used": 60, "budget_max": 60},
+        )
+        assert tripped is False
+        assert kb.get_task(conn, tid).status == "review"
+        assert _failures(conn, tid) == failures_before
+        assert _events(conn, tid, kind="gave_up") == []
+
+        monkeypatch.setattr(
+            cfgmod, "load_config",
+            lambda *a, **k: {"kanban": {"review_dispatch": False}},
+        )
+        kbd.dispatch_once(conn, spawn_fn=_spawn, dry_run=False)
+        assert tid not in spawned
+        assert kb.get_task(conn, tid).status == "review"
+
+        monkeypatch.setattr(
+            cfgmod, "load_config",
+            lambda *a, **k: {"kanban": {"review_dispatch": True}},
+        )
+        kbd.dispatch_once(conn, spawn_fn=_spawn, dry_run=False)
+        assert tid in spawned
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+        claimed = _events(conn, tid, kind="claimed")
+        assert claimed[-1][1].get("source_status") == "review"
+
+
+def test_crash_on_handed_off_review_card_does_not_requeue(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash-style failure recorded against an implementer run that already
+    handed the card to review must not bump the breaker or re-queue."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    spawned: list[str] = []
+
+    def _spawn(task, workspace, board=None):
+        spawned.append(task.id)
+        return 4242
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="crash after handoff", assignee="worker", max_retries=1,
+        )
+        kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="done",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "review"
+        failures_before = _failures(conn, tid)
+
+        tripped = kbd._record_task_failure(
+            conn, tid, error="worker crashed", outcome="crashed",
+            release_claim=False, end_run=False,
+        )
+        assert tripped is False
+        assert kb.get_task(conn, tid).status == "review"
+        assert _failures(conn, tid) == failures_before
+        assert _events(conn, tid, kind="gave_up") == []
+
+        monkeypatch.setattr(
+            cfgmod, "load_config",
+            lambda *a, **k: {"kanban": {"review_dispatch": False}},
+        )
+        kbd.dispatch_once(conn, spawn_fn=_spawn, dry_run=False)
+        assert tid not in spawned
+        assert kb.get_task(conn, tid).status == "review"
+
+
+def test_review_lane_failure_still_trips_breaker(kanban_home: Path) -> None:
+    """A reviewer run (source_status=review) that dies still counts and still
+    trips to blocked after the failure limit — behaviour we are NOT changing."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="reviewer dies", assignee="worker", max_retries=1,
+        )
+        kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        assert kb.get_task(conn, tid).status == "running"
+        assert kb._retry_status_for_run(
+            conn, tid, review.current_run_id,
+        ) == "review"
+
+        tripped = kbd._record_task_failure(
+            conn, tid, error="reviewer cannot start",
+            outcome="spawn_failed", release_claim=True, end_run=True,
+        )
+        assert tripped is True
+        blocked = kb.get_task(conn, tid)
+        assert blocked is not None
+        assert blocked.status == "blocked"
+        gave_up = _events(conn, tid, kind="gave_up")
+        assert len(gave_up) == 1
+        assert gave_up[0][1].get("retry_status") == "review"
