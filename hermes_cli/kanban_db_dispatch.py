@@ -80,6 +80,22 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 # ``HERMES_KANBAN_BLOCKER_COOLDOWN_SECONDS``.
 DEFAULT_BLOCKER_COOLDOWN_SECONDS = 1800  # 30 minutes
 
+# Dispatcher-owned Kanban workers need a per-run call allowance that scales with
+# the card. A fixed profile default made large-but-valid cards die at the call
+# ceiling and then count as bad cards. Keep this bounded: it is capacity, not a
+# license for unbounded agent loops.
+KANBAN_WORKER_MIN_TURNS = 90
+KANBAN_WORKER_MEDIUM_TURNS = 150
+KANBAN_WORKER_LARGE_TURNS = 240
+KANBAN_WORKER_MAX_TURNS = 300
+_KANBAN_WORKER_BUDGET_RE = re.compile(
+    r"(?:\b(?:call|turn|iteration)s?\s+budget\b|\bbudget\b)"
+    r"[^\d\n]{0,24}(\d{2,3})\b"
+    r"|\bmax[_\s-]?turns?\s*[:=]\s*(\d{2,3})\b",
+    re.IGNORECASE,
+)
+_KANBAN_BUDGET_EXHAUSTED_RE = re.compile(r"\bIteration budget exhausted\b", re.IGNORECASE)
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -1234,6 +1250,89 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     return sweep.crashed
 
 
+def _record_task_capacity_exhausted(
+    conn: sqlite3.Connection,
+    task_id: str,
+    error: str,
+    *,
+    release_claim: bool = True,
+    end_run: bool = True,
+    event_payload_extra: Optional[dict] = None,
+) -> bool:
+    """Record a worker call-ceiling death as capacity, not card failure.
+
+    First budget death: close the run as ``capacity``, keep the card otherwise
+    unchanged, and requeue it once without incrementing ``consecutive_failures``.
+    Second budget death on the same card: park it as a typed transient split
+    signal. Returns True for the split case.
+    """
+    error = error[:500]
+    payload_extra = event_payload_extra or {}
+    with _kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["status"] in ("review", "done"):
+            if _kb._retry_status_for_run(conn, task_id, row["current_run_id"]) != "review":
+                return False
+        retry_status = (
+            _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
+            if release_claim else ("review" if row["status"] == "review" else "ready")
+        )
+        previous = int(conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ? "
+            "AND outcome IN ('capacity', 'capacity_split')",
+            (task_id,),
+        ).fetchone()[0] or 0)
+        run_id = None
+        if previous <= 0:
+            if release_claim:
+                conn.execute(
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+                    "worker_pid = NULL, worker_started_at = NULL, last_failure_error = ? "
+                    "WHERE id = ? AND status = 'running'",
+                    (retry_status, error, task_id),
+                )
+            else:
+                conn.execute("UPDATE tasks SET last_failure_error = ? WHERE id = ?", (error, task_id))
+            if end_run:
+                run_id = _kb._end_run(
+                    conn, task_id, outcome="capacity", status="capacity", error=error,
+                    metadata={"retry_status": retry_status, **payload_extra},
+                )
+            _kb._append_event(
+                conn, task_id, "capacity_requeued",
+                {"error": error, "retry_status": retry_status, **payload_extra},
+                run_id=run_id,
+            )
+            return False
+
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, worker_started_at = NULL, block_kind = 'transient', "
+            "last_failure_error = ? WHERE id = ? AND status IN ('running', 'ready', 'review')",
+            (error, task_id),
+        )
+        if end_run:
+            run_id = _kb._end_run(
+                conn, task_id, outcome="capacity_split", status="capacity_split", error=error,
+                metadata={"previous_capacity_deaths": previous, **payload_extra},
+            )
+        note = "Second iteration-budget death: split this card smaller before retrying."
+        conn.execute(
+            "INSERT INTO task_comments(task_id, author, body, created_at) VALUES (?,?,?,?)",
+            (task_id, "dispatcher", note, time.time()),
+        )
+        _kb._append_event(
+            conn, task_id, "capacity_split",
+            {"error": error, "previous_capacity_deaths": previous, **payload_extra},
+            run_id=run_id,
+        )
+        return True
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2223,6 +2322,28 @@ def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
     return parsed if parsed >= minimum else default
 
 
+def _kanban_worker_turn_budget(task: Task) -> int:
+    """Per-worker ``agent.max_turns`` override for dispatcher-owned tasks.
+
+    Explicit body text wins (``budget: 180``, ``max_turns 120``, ``call budget
+    200``). Otherwise derive a bounded allowance from card size so a large card
+    gets more calls than the profile default without making runaway work
+    unbounded.
+    """
+    text = "\n".join(part for part in (task.title or "", task.body or "") if part)
+    for match in _KANBAN_WORKER_BUDGET_RE.finditer(text):
+        value = _positive_int(match.group(1) or match.group(2), 0, minimum=1)
+        if value:
+            return max(KANBAN_WORKER_MIN_TURNS, min(value, KANBAN_WORKER_MAX_TURNS))
+    size = len(text)
+    checklist_items = len(re.findall(r"(?m)^\s*(?:[-*]|\d+[.)])\s+", text))
+    if size >= 3000 or checklist_items >= 10:
+        return KANBAN_WORKER_LARGE_TURNS
+    if size >= 1200 or checklist_items >= 5:
+        return KANBAN_WORKER_MEDIUM_TURNS
+    return KANBAN_WORKER_MIN_TURNS
+
+
 def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, int]:
     """Return ``(rotate_bytes, backup_count)`` for worker log rotation.
     Defaults: rotate at 2 MiB, keep one backup (``.log.1``); both overridable
@@ -2504,7 +2625,10 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    cmd.extend([
+        "chat", "--max-turns", str(_kanban_worker_turn_budget(task)),
+        "-q", f"work kanban task {task.id}",
+    ])
     if task.goal_mode:
         # The kanban goal-loop hook only runs in cli.py's fully-quiet branch.
         # Without -Q the worker gets one turn, prints text, exits rc=0, and the
