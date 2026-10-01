@@ -15,6 +15,7 @@ import contextlib
 import json
 import os
 import re
+import runpy
 import secrets
 import sqlite3
 import subprocess
@@ -1245,6 +1246,35 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+def _card_shape_pieces(title: str, body: Optional[str]) -> list[tuple[str, Optional[str]]]:
+    """Ask the installed fleet rail how this card should be shaped.
+
+    The rail is operational policy, not Hermes source: an absent or broken
+    installation must never make task creation unavailable.
+    """
+    rail = kanban_home() / "scripts" / "card_shape_check.py"
+    try:
+        if not rail.is_file():
+            return []
+        namespace = runpy.run_path(str(rail))
+        shape = namespace["shape_key"](title)
+        pieces = namespace["split"](title, body or "", shape)
+        normalized: list[tuple[str, Optional[str]]] = []
+        for piece in pieces:
+            if not isinstance(piece, (list, tuple)) or len(piece) != 2:
+                raise TypeError("piece must be a (title, body) pair")
+            piece_title, piece_body = piece
+            if not isinstance(piece_title, str) or not piece_title.strip():
+                raise TypeError("piece title must be a non-empty string")
+            if piece_body is not None and not isinstance(piece_body, str):
+                raise TypeError("piece body must be a string or None")
+            normalized.append((piece_title, piece_body))
+        return normalized
+    except Exception as exc:
+        _log.warning("kanban card shape check failed open: %s", exc)
+        return []
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1259,6 +1289,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    _shape_checked: bool = False,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1286,6 +1317,54 @@ def create_task(
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}")
+    parents = tuple(p for p in parents if p)
+    skills_list = _normalize_task_skills(skills)
+
+    if not _shape_checked:
+        pieces = _card_shape_pieces(title, body)
+        if len(pieces) == 1:
+            title, body = pieces[0]
+        elif len(pieces) > 1:
+            created: list[str] = []
+            for index, (piece_title, piece_body) in enumerate(pieces):
+                piece_key = (
+                    idempotency_key
+                    if index == 0 or not idempotency_key
+                    else f"{idempotency_key}:shape:{index}"
+                )
+                created.append(create_task(
+                    conn,
+                    title=piece_title,
+                    body=piece_body,
+                    assignee=assignee,
+                    created_by=created_by,
+                    workspace_kind=workspace_kind,
+                    workspace_path=workspace_path,
+                    branch_name=branch_name,
+                    tenant=tenant,
+                    priority=priority,
+                    parents=parents,
+                    triage=triage,
+                    idempotency_key=piece_key,
+                    max_runtime_seconds=max_runtime_seconds,
+                    skills=skills_list,
+                    max_retries=max_retries,
+                    model_override=model_override,
+                    provider_override=provider_override,
+                    reasoning_effort=reasoning_effort,
+                    goal_mode=goal_mode,
+                    goal_max_turns=goal_max_turns,
+                    initial_status=initial_status,
+                    session_id=session_id,
+                    board=board,
+                    project_id=project_id,
+                    project_source_task_id=project_source_task_id,
+                    creator_task_id=creator_task_id,
+                    completion_contract=completion_contract,
+                    _shape_checked=True,
+                ))
+            return created[0]
+
     # A project-scoped board anchors every new task to its project's repo
     # (deterministic worktree + branch) without each surface repeating it.
     # An explicit ``scratch`` (or ``project_id=""``) is a request for no project:
@@ -1310,8 +1389,6 @@ def create_task(
     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
-    parents = tuple(p for p in parents if p)
-    skills_list = _normalize_task_skills(skills)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.

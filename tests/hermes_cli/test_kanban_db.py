@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -173,6 +174,77 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 # ---------------------------------------------------------------------------
 # Task creation + status inference
 # ---------------------------------------------------------------------------
+
+
+def test_create_task_replaces_dead_shape_before_insert(kanban_home):
+    scripts = kanban_home / "scripts"
+    scripts.mkdir()
+    (scripts / "card_shape_check.py").write_text(
+        """def shape_key(title):
+    return \" \".join(title.split()[:4]).lower()
+
+
+def split(title, body, shape):
+    if shape != \"ship gate: merge the\":
+        return []
+    head, tail = title.split(\": \", 1)
+    return [
+        (head + \": \" + clause, body + \"\\nPiece: \" + clause)
+        for clause in tail.split(\" + \")
+    ]
+""",
+        encoding="utf-8",
+    )
+
+    with kbc.connect() as conn:
+        parent_id = kb.create_task(conn, title="Release parent")
+        first_id = kb.create_task(
+            conn,
+            title="Ship gate: merge the demo PR + verify production",
+            body="Release the demo safely.",
+            assignee="release",
+            parents=(task_id for task_id in (parent_id,)),
+            skills=(skill for skill in ("github-code-review",)),
+            idempotency_key="ship-demo",
+        )
+        repeated_id = kb.create_task(
+            conn,
+            title="Ship gate: merge the demo PR + verify production",
+            body="Release the demo safely.",
+            assignee="release",
+            parents=(parent_id,),
+            skills=("github-code-review",),
+            idempotency_key="ship-demo",
+        )
+        rows = conn.execute(
+            "SELECT id, title, body, idempotency_key, skills FROM tasks"
+        ).fetchall()
+        linked_children = {
+            row["child_id"]
+            for row in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ?", (parent_id,)
+            ).fetchall()
+        }
+
+    by_title = {row["title"]: row for row in rows}
+    assert "Ship gate: merge the demo PR + verify production" not in by_title
+    assert set(by_title) == {
+        "Release parent",
+        "Ship gate: merge the demo PR",
+        "Ship gate: verify production",
+    }
+    assert first_id == by_title["Ship gate: merge the demo PR"]["id"]
+    assert repeated_id == first_id
+    assert by_title["Ship gate: merge the demo PR"]["idempotency_key"] == "ship-demo"
+    assert by_title["Ship gate: verify production"]["idempotency_key"] == "ship-demo:shape:1"
+    assert by_title["Ship gate: merge the demo PR"]["body"].endswith("Piece: merge the demo PR")
+    assert by_title["Ship gate: verify production"]["body"].endswith("Piece: verify production")
+    assert json.loads(by_title["Ship gate: merge the demo PR"]["skills"]) == ["github-code-review"]
+    assert json.loads(by_title["Ship gate: verify production"]["skills"]) == ["github-code-review"]
+    assert linked_children == {
+        by_title["Ship gate: merge the demo PR"]["id"],
+        by_title["Ship gate: verify production"]["id"],
+    }
 
 
 
