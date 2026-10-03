@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -1945,6 +1946,169 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _read_health_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _provider_health_snapshot() -> dict[str, Any]:
+    """Read the operator's provider policy and completion-probe evidence once per tick."""
+    from hermes_constants import get_default_hermes_root
+
+    state_dir = get_default_hermes_root() / "state"
+    policy = _read_health_json(state_dir / "provider-policy.json")
+    probe = _read_health_json(state_dir / "fallback_chain.json")
+    try:
+        from hermes_cli.provider_catalog import provider_catalog_by_slug
+        known = set(provider_catalog_by_slug())
+    except Exception:
+        known = set()
+    # Local/native runners such as cursor and ollama are not catalog providers,
+    # but a policy stack naming one makes it an operator-approved provider id.
+    stacks = policy.get("stacks")
+    for stack in stacks.values() if isinstance(stacks, dict) else ():
+        if not isinstance(stack, dict):
+            continue
+        entries = [stack.get("primary"), *((stack.get("fallbacks") or []))]
+        known.update(
+            str(entry.get("provider") or "").strip().lower()
+            for entry in entries if isinstance(entry, dict) and entry.get("provider")
+        )
+    raw_outages = policy.get("outages")
+    outages = {
+        str(provider).strip().lower(): detail
+        for provider, detail in (raw_outages.items() if isinstance(raw_outages, dict) else ())
+        if str(provider).strip().lower() in known
+    }
+    profiles = {
+        str(entry.get("name") or "").strip().lower(): entry.get("rungs") or []
+        for entry in (probe.get("profiles") or []) if isinstance(entry, dict)
+    }
+    return {
+        "outages": outages,
+        "rungs": probe.get("rungs") or [],
+        "profiles": profiles,
+        "auth": {},
+    }
+
+
+def _provider_last_run_error(
+    health: dict[str, Any], assignee: str, provider: str,
+) -> Optional[str]:
+    """Return a bounded reason when every credential is still unavailable."""
+    key = (assignee.strip().lower(), provider)
+    cached = health["auth"].get(key)
+    if key in health["auth"]:
+        return cached
+    try:
+        from agent.credential_pool import (
+            PooledCredential, STATUS_DEAD, STATUS_EXHAUSTED, _exhausted_until,
+        )
+        from hermes_cli.profiles import get_profile_dir
+
+        store = _read_health_json(get_profile_dir(assignee) / "auth.json")
+        raw_entries = (store.get("credential_pool") or {}).get(provider) or []
+        entries = [
+            PooledCredential.from_dict(provider, entry)
+            for entry in raw_entries if isinstance(entry, dict)
+        ]
+        non_dead = sum(entry.last_status != STATUS_DEAD for entry in entries)
+        unavailable = []
+        for entry in entries:
+            if entry.last_status == STATUS_DEAD:
+                unavailable.append(entry)
+            elif entry.last_status == STATUS_EXHAUSTED:
+                until = _exhausted_until(entry, sole_credential=non_dead <= 1)
+                if until is None or until > time.time():
+                    unavailable.append(entry)
+            else:
+                health["auth"][key] = None
+                return None
+        if entries and len(unavailable) == len(entries):
+            newest = max(unavailable, key=lambda entry: entry.last_status_at or 0)
+            detail = newest.last_error_reason or newest.last_error_code or newest.last_status
+            cached = f"last run error {detail}"
+        else:
+            cached = None
+    except Exception:
+        cached = None
+    health["auth"][key] = cached
+    return cached
+
+
+def _provider_health_hold_reason(
+    row: sqlite3.Row, assignee: str, health: dict[str, Any],
+) -> Optional[str]:
+    """Explain why every provider rung for this card is explicitly unhealthy."""
+    pinned = str(row["provider_override"] or "").strip().lower()
+    model = str(row["model_override"] or "").strip()
+    rungs = health["profiles"].get(assignee.strip().lower())
+    if rungs is None and assignee.strip().lower() == "default":
+        rungs = health["rungs"]
+    rungs = [rung for rung in (rungs or []) if isinstance(rung, dict)]
+    if pinned:
+        matching = [
+            rung for rung in rungs
+            if str(rung.get("provider") or "").strip().lower() == pinned
+            and (not model or str(rung.get("model") or "").strip() == model)
+        ]
+        rungs = matching or [{"provider": pinned, "model": model}]
+    if not rungs:
+        return None
+
+    reasons = []
+    unknown = False
+    for rung in rungs:
+        provider = str(rung.get("provider") or "").strip().lower()
+        verdict = str(rung.get("verdict") or "").strip().lower()
+        outage = health["outages"].get(provider)
+        if outage is not None:
+            detail = outage.get("reason") if isinstance(outage, dict) else outage
+            reasons.append(f"{provider}: policy outage{f' ({detail})' if detail else ''}")
+            continue
+        last_error = _provider_last_run_error(health, assignee, provider) if provider else None
+        if last_error:
+            reasons.append(f"{provider}: {last_error}")
+            continue
+        if verdict in {"ok", "repaired"}:
+            return None
+        if not verdict or verdict == "native-sdk":
+            # SDK/native discovery proves installation, not that a completion
+            # can pass a quota wall. Without contrary evidence, fail open.
+            unknown = True
+            continue
+        reasons.append(f"{provider or 'unconfigured'}: completion probe {verdict}")
+    if unknown or not reasons:
+        return None
+    prefix = f"pinned provider {pinned}" if pinned else f"no usable provider rung for {assignee}"
+    return f"{prefix}: {'; '.join(reasons)}"
+
+
+def _record_dispatch_hold(
+    conn: sqlite3.Connection, task_id: str, reason: str,
+    result: "DispatchResult", *, dry_run: bool,
+) -> None:
+    result.respawn_guarded.append((task_id, reason))
+    if dry_run:
+        return
+    with _kb.write_txn(conn):
+        latest = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        already = (
+            latest is not None
+            and latest["kind"] == "respawn_guarded"
+            and _kb._json_dict(latest["payload"]).get("reason") == reason
+        )
+        if not already:
+            _kb._append_event(conn, task_id, "respawn_guarded", {"reason": reason})
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -1957,6 +2121,7 @@ def _dispatch_lane_task(
     board: Optional[str],
     failure_limit: int,
     spawn_fn,
+    provider_health: dict[str, Any],
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
 ) -> bool:
@@ -1973,6 +2138,10 @@ def _dispatch_lane_task(
     if profile_exists is not None and not profile_exists(assignee):
         result.skipped_nonspawnable.append(task_id)
         return False
+    health_reason = _provider_health_hold_reason(row, assignee, provider_health)
+    if health_reason is not None:
+        _record_dispatch_hold(conn, task_id, health_reason, result, dry_run=dry_run)
+        return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.
     if per_profile_cap is not None:
@@ -1982,25 +2151,7 @@ def _dispatch_lane_task(
             return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
-        result.respawn_guarded.append((task_id, guard_reason))
-        # Event so ``hermes kanban tail`` shows why the task looks stuck. A held
-        # card can sit on the same guard for many ticks; append only when the
-        # task's newest event is not already an identical ``respawn_guarded``
-        # with the same reason, so the event table does not grow one row per tick.
-        if not dry_run:
-            with _kb.write_txn(conn):
-                latest = conn.execute(
-                    "SELECT kind, payload FROM task_events "
-                    "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
-                    (task_id,),
-                ).fetchone()
-                already = (
-                    latest is not None
-                    and latest["kind"] == "respawn_guarded"
-                    and _kb._json_dict(latest["payload"]).get("reason") == guard_reason
-                )
-                if not already:
-                    _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+        _record_dispatch_hold(conn, task_id, guard_reason, result, dry_run=dry_run)
         return False
 
     def _count_spawn(name: str) -> None:
@@ -2180,7 +2331,7 @@ def _tick_spawn_budget(
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, model_override, provider_override FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -2278,6 +2429,7 @@ def _dispatch_once_locked(
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
+        provider_health=_provider_health_snapshot(),
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
