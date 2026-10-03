@@ -105,6 +105,20 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+_TARGET_PR_RE = re.compile(r"\b([a-z][a-z0-9_-]*)\s+pr\s*#?\s*(\d{2,})\b", re.IGNORECASE)
+_TARGET_SLUG_YEAR_RE = re.compile(r"\b([a-z][a-z0-9]*)-(20\d{2})(?:-\d{2}-\d{2})?\b", re.IGNORECASE)
+_TARGET_WORDS_YEAR_RE = re.compile(
+    r"\b([a-z][a-z0-9]*)\s+([a-z][a-z0-9]*)\s+(20\d{2})(?:-\d{2}-\d{2})?\b",
+    re.IGNORECASE,
+)
+_TARGET_APPROACH_DATE_RE = re.compile(r"\b20\d{2}-\d{2}-\d{2}\b")
+_BAD_WORKER_COMMAND_RE = re.compile(
+    r"(?:hermes:\s*)?['\"]?(\d+)['\"]? is not a `hermes` command",
+    re.IGNORECASE,
+)
+_TARGET_BREAKER_WINDOW_SECONDS = 7 * 86400
+_TARGET_FAILURE_OUTCOMES = ("crashed", "timed_out", "gave_up", "reclaimed", "spawn_failed")
+
 
 @dataclass
 class DispatchResult:
@@ -2109,6 +2123,145 @@ def _record_dispatch_hold(
             _kb._append_event(conn, task_id, "respawn_guarded", {"reason": reason})
 
 
+def _target_identity(title: str) -> Optional[str]:
+    """Stable target name for the forms the fleet lookback already groups."""
+    match = _TARGET_PR_RE.search(title or "")
+    if match:
+        return f"{match.group(1)}pr{match.group(2)}".lower()
+    match = _TARGET_SLUG_YEAR_RE.search(title or "")
+    if match:
+        return f"{match.group(1)}-{match.group(2)}".lower()
+    match = _TARGET_WORDS_YEAR_RE.search(title or "")
+    if match:
+        return "".join(match.groups()).lower()
+    return None
+
+
+def _target_approach(title: str) -> str:
+    """Compare dated reissues as one approach without conflating rewrites."""
+    return " ".join(_TARGET_APPROACH_DATE_RE.sub("<date>", title.lower()).split())
+
+
+def _target_failure_snapshot(
+    conn: sqlite3.Connection, failure_limit: int,
+) -> dict[str, dict[str, Any]]:
+    """Ready task id -> repeated target/approach failure evidence.
+
+    A completion resets the group, matching the task-level consecutive-failure
+    breaker.  Only the lookback's seven-day window is considered, so a repaired
+    historical approach is not parked forever.
+    """
+    outcomes = (*_TARGET_FAILURE_OUTCOMES, "completed")
+    placeholders = ",".join("?" for _ in outcomes)
+    rows = conn.execute(
+        "SELECT t.title, r.outcome, r.error, r.summary, "
+        "r.started_at, r.id FROM task_runs r "
+        "JOIN tasks t ON t.id = r.task_id "
+        f"WHERE r.outcome IN ({placeholders}) AND r.started_at >= ? "
+        "ORDER BY r.started_at, r.id",
+        (*outcomes, int(time.time()) - _TARGET_BREAKER_WINDOW_SECONDS),
+    ).fetchall()
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        target = _target_identity(row["title"])
+        if target is None:
+            continue
+        key = (target, _target_approach(row["title"]))
+        state = groups.setdefault(key, {"failures": 0})
+        if row["outcome"] == "completed":
+            state.clear()
+            state["failures"] = 0
+        else:
+            state.update(
+                failures=int(state["failures"]) + 1,
+                last_output=(row["error"] or row["summary"] or "No output recorded."),
+            )
+
+    findings: dict[str, dict[str, Any]] = {}
+    for row in conn.execute(
+        "SELECT id, title, assignee, created_by, max_retries FROM tasks "
+        "WHERE status = 'ready' AND claim_lock IS NULL"
+    ):
+        target = _target_identity(row["title"])
+        if target is None:
+            continue
+        approach = _target_approach(row["title"])
+        state = groups.get((target, approach))
+        threshold = row["max_retries"] if row["max_retries"] is not None else failure_limit
+        threshold = max(1, int(threshold))
+        if state is None or int(state["failures"]) < threshold:
+            continue
+        findings[row["id"]] = {
+            **state,
+            "target": target,
+            "approach": row["title"],
+            "assignee": row["assignee"],
+            "created_by": row["created_by"],
+            "threshold": threshold,
+        }
+    return findings
+
+
+def _target_next_experiment(finding: Mapping[str, Any], task_id: str) -> str:
+    last_output = str(finding["last_output"])
+    bad_command = _BAD_WORKER_COMMAND_RE.search(last_output)
+    if bad_command:
+        turns = bad_command.group(1)
+        return (
+            f'Run `hermes chat --max-turns {turns} -q "work kanban task {task_id}"` once '
+            "and verify the worker reaches task execution instead of parsing the turn budget as a command."
+        )
+    return (
+        f"Create one supervised replacement card for `{finding['target']}` with `max_retries=1`, "
+        "execute it once using a different approach, and attach its exact command and output before "
+        f"unblocking `{task_id}`."
+    )
+
+
+def _apply_target_breaker(
+    conn: sqlite3.Connection, task_id: str, finding: Mapping[str, Any],
+    result: "DispatchResult", *, dry_run: bool, board: Optional[str],
+) -> bool:
+    """Park one repeated target/approach and create its one corrective card."""
+    reason = (
+        f"target_breaker: {finding['target']} failed {finding['failures']} times "
+        f"with the same approach (limit {finding['threshold']})"
+    )
+    if dry_run:
+        result.respawn_guarded.append((task_id, reason))
+        return True
+
+    corrective_id = None
+    try:
+        body = (
+            f"Target: {finding['target']}\n"
+            f"Failing approach: {finding['approach']}\n"
+            f"Last output:\n{str(finding['last_output'])[:1000]}\n\n"
+            f"Exact next experiment: {_target_next_experiment(finding, task_id)}\n\n"
+            f"Source task: {task_id}\n"
+            f"Observed consecutive failures: {finding['failures']}"
+        )
+        corrective_id = _kb.create_task(
+            conn,
+            title=f"Correct stuck target: {finding['target']}",
+            body=body,
+            assignee=finding.get("created_by") or finding.get("assignee"),
+            created_by="dispatcher",
+            initial_status="blocked",
+            idempotency_key=f"stuck-target:{finding['target']}",
+            max_retries=1,
+            board=board,
+        )
+    except Exception:
+        _kb._log.exception("kanban target breaker: corrective card creation failed for %s", task_id)
+
+    if corrective_id:
+        reason += f"; corrective card {corrective_id}"
+    if _kb.block_task(conn, task_id, reason=reason):
+        result.auto_blocked.append(task_id)
+    return True
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2122,6 +2275,7 @@ def _dispatch_lane_task(
     failure_limit: int,
     spawn_fn,
     provider_health: dict[str, Any],
+    target_failures: Mapping[str, Mapping[str, Any]],
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
 ) -> bool:
@@ -2130,6 +2284,12 @@ def _dispatch_lane_task(
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    target_failure = target_failures.get(task_id)
+    if target_failure is not None:
+        _apply_target_breaker(
+            conn, task_id, target_failure, result, dry_run=dry_run, board=board,
+        )
+        return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
@@ -2430,6 +2590,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         provider_health=_provider_health_snapshot(),
+        target_failures=_target_failure_snapshot(conn, failure_limit),
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
